@@ -28,7 +28,6 @@
 
 #include "afl-fuzz.h"
 #include "afl-ijon-min.h"
-#include <sys/time.h>
 #include <sys/stat.h>
 #include <signal.h>
 #include <limits.h>
@@ -1476,6 +1475,18 @@ u8 __attribute__((hot)) common_fuzz_stuff(afl_state_t *afl, u8 *out_buf,
                                           u32 len) {
 
   u8 fault;
+
+  /* AFLNet state-aware region mode: out_buf holds the mutated M2; reassemble
+     M1 + M2 + M3 so the network send (late_send -> fsrv.custom_input) and
+     the saved queue entry both see the full message chain. */
+  if (unlikely(afl->aflnet && afl->aflnet->region_mode)) {
+
+    u32 full_len;
+    u8 *full = aflnet_reassemble_region(afl, out_buf, len, &full_len);
+    out_buf = full;
+    len = full_len;
+
+  }
 
   if (likely(!afl->afl_env.afl_frameshift_disabled && afl->fs_curr_meta &&
              afl->queue_cur->fs_status != 0)) {

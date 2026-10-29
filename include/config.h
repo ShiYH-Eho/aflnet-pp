@@ -449,6 +449,14 @@ We add 4 byte for one u32 length field. */
 #define PERSIST_ENV_VAR "__AFL_PERSISTENT"
 #define DEFER_ENV_VAR "__AFL_DEFER_FORKSRV"
 
+/* AFLNet: user-facing, value-aware deferred-forkserver switch.  AFL++'s own
+   AFL_DEFER_FORKSRV is deprecated and enables deferred mode whenever it is
+   present, so "AFL_DEFER_FORKSRV=0" cannot turn it off; AFLNET_DEFER_FORKSRV
+   is checked with its value (non-zero = defer, 0 = native constructor
+   forkserver).  Either way the target / preloaded sockhook is told through
+   DEFER_ENV_VAR, which is what it actually reads. */
+#define AFLNET_DEFER_ENV_VAR "AFLNET_DEFER_FORKSRV"
+
 /* In-code signatures for deferred and persistent mode. */
 
 #define PERSIST_SIG "##SIG_AFL_PERSISTENT##"
@@ -503,6 +511,24 @@ We add 4 byte for one u32 length field. */
 #else
   #define MAP_INITIAL_SIZE MAP_SIZE
 #endif
+
+/* AFLNet state-aware feedback constants. State transitions are hashed into a
+   dedicated region of the coverage bitmap (state feedback). */
+
+#ifndef STATE_SIZE_POW2
+  #define STATE_SIZE_POW2 8
+  #define STATE_SIZE (1 << STATE_SIZE_POW2)
+#endif
+#define SHIFT_SIZE (1 << (MAP_SIZE_POW2 - 1))
+#define STATE_STR_LEN 12
+
+/* State variable feedback (state_mode == AFLNET_STATE_VAR_MODE): a dedicated shared memory region
+   that the instrumented target writes its current state-variable values into.
+   After each server response, the fuzzer hashes this region to derive a state
+   id. The env var below passes the SHM id/path to the target. */
+
+#define AFLNET_STATEVAR_SHM_ENV_VAR "__AFL_AFLNET_STATEVAR_SHM_ID"
+#define AFLNET_STATEVAR_SHM_SIZE (1U << 14)    /* 16 KB, plenty for state vars */
 
 /* IJON max tracking map configuration */
 

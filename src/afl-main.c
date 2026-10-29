@@ -251,7 +251,28 @@ static inline void afl_fuzz_queue(afl_state_t *afl) {
 
   do {
 
-    if (likely(!afl->old_seed_selection)) {
+    /* Decide once per iteration whether the state-aware (IPSM) scheduler is
+       used.  aflnet_use_state_scheduler() implements the original AFLNet
+       seed_schedule_type: CODE_AWARE (never), IPSM (always), HYBRID
+       (probabilistic, based on the time since the last new path).  The result
+       is mirrored into code_aware_schedule (1 = code-aware/normal scheduling
+       this iteration, 0 = state-aware/IPSM scheduling), which gates
+       fuzz_one()'s generic skip heuristics and the state-aware
+       pending_favored in cull_queue(). */
+    if (unlikely(afl->afl_env.aflnet_mode && afl->aflnet)) {
+
+      afl->aflnet->code_aware_schedule = !aflnet_use_state_scheduler(afl);
+
+    }
+
+    /* Custom queue scheduler hook: pick a target state and then a seed that
+       reaches it (IPSM-guided).  Falls back to the normal selection while
+       the callback returns 0 (e.g. not enough states discovered yet). */
+    if (unlikely(!afl->aflnet->code_aware_schedule && aflnet_select_next_seed(afl))) {
+
+      /* queue_cur / current_entry were set by the custom scheduler */
+
+    } else if (likely(!afl->old_seed_selection)) {
 
       if (likely(afl->pending_favored && afl->smallest_favored >= 0)) {
 
@@ -303,6 +324,7 @@ static inline void afl_fuzz_queue(afl_state_t *afl) {
     }
 
     afl->skipped_fuzz = fuzz_one(afl);
+
 #ifdef INTROSPECTION
     ++afl->queue_cur->stats_selected;
 

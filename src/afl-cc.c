@@ -317,6 +317,7 @@ param_st parse_linking_params(aflcc_state_t *, u8 *, u8, u8 *skip_next,
 
 void add_lto_linker(aflcc_state_t *);
 void add_lto_passes(aflcc_state_t *);
+static void add_statevar_runtime(aflcc_state_t *);
 void add_runtime(aflcc_state_t *);
 
 /** Global declarations -----END----- **/
@@ -575,10 +576,8 @@ void find_built_deps(aflcc_state_t *aflcc) {
 #if defined(__x86_64__) || defined(__i386__)
   if ((ptr = find_object(aflcc, "afl-as")) != NULL) {
 
-  #ifndef __APPLE__
-    // on OSX clang masquerades as GCC
-    aflcc->have_gcc = 1;
-  #endif
+    /* afl-as is retained only for the legacy afl-clang assembler mode;
+       afl-gcc remains removed. */
     aflcc->have_clang = 1;
     ck_free(ptr);
 
@@ -1159,6 +1158,8 @@ void mode_final_checkout(aflcc_state_t *aflcc) {
     case GCC:
       break;
     case CLANG:
+      if (!aflcc->have_clang)
+        FATAL("afl-clang is not available on your platform!");
       break;
     case LLVM:
       if (!aflcc->have_llvm)
@@ -1187,6 +1188,8 @@ void mode_final_checkout(aflcc_state_t *aflcc) {
 
   if (aflcc->compiler_mode == CLANG) {
 
+    setenv(CLANG_ENV_VAR, "1", 1);  // used by afl-as
+
     /* if our PCGUARD implementation is not available then silently switch to
      native LLVM PCGUARD. Or classic asm instrument is explicitly preferred. */
     if (!aflcc->have_optimized_pcguard &&
@@ -1198,7 +1201,6 @@ void mode_final_checkout(aflcc_state_t *aflcc) {
     } else {
 
       aflcc->instrument_mode = INSTRUMENT_CLANG;
-      setenv(CLANG_ENV_VAR, "1", 1);  // used by afl-as
 
     }
 
@@ -2395,6 +2397,38 @@ void add_lto_passes(aflcc_state_t *aflcc) {
 
 }
 
+/* Link the independent statevar runtime whenever its LLVM pass is requested.
+   It has no coverage or forkserver dependency and can therefore coexist with
+   the regular runtime as well as with legacy assembler instrumentation. */
+static void add_statevar_runtime(aflcc_state_t *aflcc) {
+
+  if (!getenv("AFL_LLVM_STATEVAR") ||
+      (aflcc->compiler_mode != CLANG && aflcc->compiler_mode != LLVM &&
+       aflcc->compiler_mode != LTO) ||
+      getenv("AFL_LLVM_ONLY_FSRV") || aflcc->partial_linking) {
+    return;
+  }
+
+  switch (aflcc->bit_mode) {
+
+    case 0:
+      insert_object(aflcc, "afl-statevar-rt.o", 0, 0);
+      break;
+
+    case 32:
+      insert_object(aflcc, "afl-statevar-rt-32.o", 0,
+                    "-m32 is not supported by your compiler");
+      break;
+
+    case 64:
+      insert_object(aflcc, "afl-statevar-rt-64.o", 0,
+                    "-m64 is not supported by your compiler");
+      break;
+
+  }
+
+}
+
 /* Add params to link with runtimes depended by our instrumentation */
 void add_runtime(aflcc_state_t *aflcc) {
 
@@ -2496,6 +2530,8 @@ void add_runtime(aflcc_state_t *aflcc) {
   }
 
 #endif
+
+  add_statevar_runtime(aflcc);
 
   add_aflpplib(aflcc);  // double insertion helps compiling
 
@@ -3063,6 +3099,11 @@ static void maybe_usage(aflcc_state_t *aflcc, int argc, char **argv) {
             "  AFL_LLVM_INJECTIONS_XSS: enables XSS injections hooking\n"
             "  AFL_LLVM_IJON: enable IJON max tracking (auto-detects "
             "_USE_IJON)\n"
+            "  AFL_LLVM_STATEVAR: enable AFLNet state-variable feedback "
+            "instrumentation\n"
+            "    (records every store to a __AFL_STATE_VAR__ annotated "
+            "variable into the\n"
+            "    dedicated state SHM used by afl-fuzz state_mode 2)\n"
             "  AFL_LLVM_LAF_ALL: enables all LAF splits/transforms\n"
             "  AFL_LLVM_LAF_SPLIT_COMPARES: enable cascaded comparisons\n"
             "  AFL_LLVM_LAF_SPLIT_COMPARES_BITW: size limit (default 8)\n"
@@ -3808,6 +3849,17 @@ static void edit_params(aflcc_state_t *aflcc, u32 argc, char **argv,
 
   }
 
+  /* State-variable recording is an LLVM IR pass and is independent of the
+     coverage backend.  Load it for every clang/LLVM-based mode, including the
+     legacy afl-clang assembler mode. */
+  if (getenv("AFL_LLVM_STATEVAR") &&
+      (aflcc->compiler_mode == CLANG || aflcc->compiler_mode == LLVM ||
+       aflcc->compiler_mode == LTO)) {
+
+    load_llvm_pass(aflcc, "afl-llvm-statevar-pass.so");
+
+  }
+
   /* Inspect the command line parameters. */
 
   process_params(aflcc, 0, argc, argv);
@@ -3848,19 +3900,27 @@ int main(int argc, char **argv, char **envp) {
 
   maybe_usage(aflcc, argc, argv);
 
-  if (aflcc->instrument_mode == INSTRUMENT_GCC ||
-      aflcc->instrument_mode == INSTRUMENT_CLANG) {
+  if (aflcc->instrument_mode == INSTRUMENT_GCC) {
 
     FATAL(
-        "afl-gcc/afl-clang are obsolete and has been removed. Use "
-        "afl-clang-fast/afl-gcc-fast for instrumentation instead.");
+        "afl-gcc has been removed. Use afl-gcc-fast for instrumentation "
+        "instead.");
+
+  }
+
+  if (aflcc->instrument_mode == INSTRUMENT_CLANG && aflcc->need_aflpplib) {
+
+    FATAL(
+        "afl-clang legacy assembler mode cannot be used together with "
+        "-fsanitize=fuzzer; use afl-clang-fast instead.");
 
   }
 
   // We only support plugins with LLVM 14 onwards
 #if LLVM_MAJOR < 14
   if (aflcc->instrument_mode != INSTRUMENT_LLVMNATIVE &&
-      aflcc->compiler_mode != GCC_PLUGIN) {
+      aflcc->compiler_mode != GCC_PLUGIN &&
+      aflcc->compiler_mode != CLANG) {
 
     aflcc->instrument_mode = INSTRUMENT_LLVMNATIVE;
     aflcc->compiler_mode = LLVM;

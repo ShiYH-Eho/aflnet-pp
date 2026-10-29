@@ -1,0 +1,1265 @@
+Binary files ./aflnet-pp/src/afl-common.o and /home/shiyinghao/aflnet-pp/src/afl-common.o differ
+Binary files ./aflnet-pp/src/afl-forkserver.o and /home/shiyinghao/aflnet-pp/src/afl-forkserver.o differ
+diff --color -rup ./aflnet-pp/src/afl-fuzz-bitmap.c /home/shiyinghao/aflnet-pp/src/afl-fuzz-bitmap.c
+--- ./aflnet-pp/src/afl-fuzz-bitmap.c	2026-08-30 01:20:39.000000000 +0800
++++ /home/shiyinghao/aflnet-pp/src/afl-fuzz-bitmap.c	2026-10-21 04:08:41.027801543 +0800
+@@ -1022,6 +1022,8 @@ may_save_fault:
+ 
+     keep_as_crash:
+ 
++      fault = FSRV_RUN_CRASH;
++
+       /* This is handled in a manner roughly similar to timeouts,
+          except for slightly different limits and no need to re-run test
+          cases. */
+@@ -1125,6 +1127,12 @@ may_save_fault:
+     ck_write(fd, mem, len, fn);
+     close(fd);
+ 
++    /* AFLNet: keep a replayable copy alongside every saved fault.  The
++       replayable file uses the same basename as the raw crashes/hangs entry
++       and contains only the messages actually sent before the failure. */
++    aflnet_save_replayable_fault(afl, mem, len, fn,
++                                 fault == FSRV_RUN_CRASH);
++
+   }
+ 
+   if (unlikely(afl->infoexec) && fault == FSRV_RUN_CRASH) {
+diff --color -rup ./aflnet-pp/src/afl-fuzz-init.c /home/shiyinghao/aflnet-pp/src/afl-fuzz-init.c
+--- ./aflnet-pp/src/afl-fuzz-init.c	2026-09-21 20:47:56.000000000 +0800
++++ /home/shiyinghao/aflnet-pp/src/afl-fuzz-init.c	2026-10-21 04:08:42.911844778 +0800
+@@ -1331,6 +1331,8 @@ void perform_dry_run(afl_state_t *afl) {
+ 
+           close(fd);
+ 
++          aflnet_save_replayable_fault(afl, use_mem, read_len, crash_fn, 1);
++
+ #ifdef __linux__
+           if (afl->fsrv.nyx_mode) {
+ 
+@@ -2424,6 +2426,16 @@ void setup_dirs_fds(afl_state_t *afl) {
+   if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
+   ck_free(tmp);
+ 
++  /* AFLNet: replayable copies of recorded crashes and hangs. */
++
++  tmp = alloc_printf("%s/replayable-crashes", afl->out_dir);
++  if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
++  ck_free(tmp);
++
++  tmp = alloc_printf("%s/replayable-hangs", afl->out_dir);
++  if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
++  ck_free(tmp);
++
+   /* Top-level directory for queue metadata used for session
+      resume and related tasks. */
+ 
+Only in ./aflnet-pp/src: afl-fuzz-mutators.o
+Only in ./aflnet-pp/src: afl-fuzz-python.o
+Binary files ./aflnet-pp/src/afl-performance.o and /home/shiyinghao/aflnet-pp/src/afl-performance.o differ
+Binary files ./aflnet-pp/src/afl-sharedmem.o and /home/shiyinghao/aflnet-pp/src/afl-sharedmem.o differ
+diff --color -rup ./aflnet-pp/src/aflnet/aflnet-internal.h /home/shiyinghao/aflnet-pp/src/aflnet/aflnet-internal.h
+--- ./aflnet-pp/src/aflnet/aflnet-internal.h	2026-10-01 22:58:10.000000000 +0800
++++ /home/shiyinghao/aflnet-pp/src/aflnet/aflnet-internal.h	2026-10-21 23:22:15.101119903 +0800
+@@ -42,6 +42,8 @@ void aflnet_state_add_seed(aflnet_state_
+ u32 aflnet_state_seq_hash(u32 *seq, u32 count);
+ u8 aflnet_is_path_seen(aflnet_state_t *an, u32 hash);
+ void aflnet_mark_path_seen(aflnet_state_t *an, u32 hash);
++void aflnet_record_sequence_edges(aflnet_state_t *an, u32 *sequence,
++                                  u32 count);
+ 
+ /* Increment the per-state fuzz counter for each distinct state visited by the
+    most recent run's state sequence.  Called from feedback.c after every run;
+@@ -93,30 +95,11 @@ void aflnet_sock2shm_setup(struct afl_st
+    ready for the next request.  Called from aflnet_configure_from_env. */
+ void aflnet_sock_shm_sync_setup(struct afl_state *afl);
+ 
+-/* 1 when the sockhook SHM rendezvous is armed for this run (sock_mode == 2, or
+-   sock_mode == 1 with AFLNET_SHM_SYNC=1 and the segments in place). */
+-int aflnet_shm_sync_enabled(struct afl_state *afl);
+-
+-/* Standalone sockhook sync (sock_mode == 1 + AFLNET_SHM_SYNC=1): wait
+-   (bounded by AFLNET_SOCK2SHM_WAIT_TIME) for the target to publish that it
+-   is accepting connections.  Returns 1 when the target signalled, 0 when the
+-   sync is off or the signal did not arrive in time. */
+-int aflnet_shm_sync_wait_ready(struct afl_state *afl);
+-
+-/* Standalone sockhook sync: tell the target that a request is on its way
+-   (the target's recv() hook waits for this before it reads the socket). */
+-void aflnet_shm_sync_notify_request(struct afl_state *afl);
+-
+-/* Standalone sockhook sync: wait (bounded) for the target to hand the turn
+-   back after it consumed the request / produced the response.  Returns 1
+-   when the target signalled. */
+-int aflnet_shm_sync_wait_response(struct afl_state *afl);
+-
+-/* Standalone sockhook sync: end the session from the client side (is_end=1 +
+-   release the target's turn-taking wait).  Called once the exchange is over,
+-   before the socket is closed; the next run's init_session is meant to clear
+-   it (not wired up yet - see the note below). */
+-void aflnet_shm_sync_notify_end(struct afl_state *afl);
++/* The standalone sockhook rendezvous (sock_mode == 1 + AFLNET_SHM_SYNC=1).
++   aflnet_configure_from_env() installs it in aflnet_state_t.sync_ops for that
++   configuration and leaves sync_ops NULL everywhere else, so net.c only has to
++   call through the table. */
++extern const aflnet_sync_ops_t aflnet_shm_sync_ops;
+ 
+ /* Preload sockhook.so into the target for every server mode and export the
+    default target-facing configuration the preloaded library needs: ENV_NETPORT
+@@ -130,10 +113,9 @@ void aflnet_sockhook_preload(struct afl_
+ 
+ /* Reset the shared msg segment before each target run, for sock_mode ==
+    AFLNET_SOCK2SHM and for the standalone sync (sock_mode=1 +
+-   AFLNET_SHM_SYNC=1, which shares the same segments).  It belongs in
+-   fuzz_run_target before the forkserver spawn; OPEN ITEM: the pointer is
+-   assigned in config.c but never invoked yet, so the reset does not actually
+-   happen (see utils/sockhook/README.md). */
++   AFLNET_SHM_SYNC=1, which shares the same segments).  It runs in the
++   module's afl_custom_post_run() (src/aflnet/module.c), i.e. after the
++   previous run finished and before the forkserver spawns the next child. */
+ int aflnet_sock2shm_init_session(struct afl_state *afl);
+ 
+ /* sock_mode == AFLNET_SOCK2SHM: connect to the server and exchange the
+diff --color -rup ./aflnet-pp/src/aflnet/config.c /home/shiyinghao/aflnet-pp/src/aflnet/config.c
+--- ./aflnet-pp/src/aflnet/config.c	2026-10-12 15:40:04.000000000 +0800
++++ /home/shiyinghao/aflnet-pp/src/aflnet/config.c	2026-10-21 23:22:04.756961659 +0800
+@@ -187,6 +187,7 @@ void aflnet_state_deinit(afl_state_t *af
+   }
+ 
+   if (an->path_hashes) { ck_free(an->path_hashes); }
++  if (an->ipsm_edges) { ck_free(an->ipsm_edges); }
+   if (an->response_buf) { ck_free(an->response_buf); }
+   if (an->response_bytes) { ck_free(an->response_bytes); }
+   if (an->state_sequence) { ck_free(an->state_sequence); }
+@@ -503,6 +504,21 @@ void aflnet_configure_from_env(afl_state
+ 
+   }
+ 
++  /* session synchronisation for this run: pick the implementation of the
++     configured sock mode.  Only the standalone rendezvous on top of the plain
++     real-socket interaction needs the client-side driver; the SHM redirection
++     (sock_mode=2) keeps its handshake inside the SHM message helpers, so it
++     leaves sync_ops NULL and net.c drives nothing there. */
++  if (afl->aflnet->sock_mode == AFLNET_SOCK && afl->aflnet->shm_sync) {
++
++    afl->aflnet->sync_ops = &aflnet_shm_sync_ops;
++
++  } else {
++
++    afl->aflnet->sync_ops = NULL;
++
++  }
++
+   /* no persistent socket yet */
+   afl->aflnet->sockfd = -1;
+ 
+diff --color -rup ./aflnet-pp/src/aflnet/feedback.c /home/shiyinghao/aflnet-pp/src/aflnet/feedback.c
+--- ./aflnet-pp/src/aflnet/feedback.c	2026-08-30 06:15:53.000000000 +0800
++++ /home/shiyinghao/aflnet-pp/src/aflnet/feedback.c	2026-10-21 23:22:19.929193394 +0800
+@@ -27,6 +27,13 @@ void aflnet_update_ipsm(afl_state_t *afl
+ 
+   if (!an->state_sequence || !an->state_count) { return; }
+ 
++  u32 states_before = an->state_ids_count;
++
++  /* Preserve every distinct transition from this path.  Edges are recorded
++     on every IPSM update so a later state discovery publishes the complete
++     graph observed up to that point. */
++  aflnet_record_sequence_edges(an, an->state_sequence, an->state_count);
++
+   /* state sequence novelty (IPSM path discovery) */
+   u32 h = aflnet_state_seq_hash(an->state_sequence, an->state_count);
+   if (!aflnet_is_path_seen(an, h)) { aflnet_mark_path_seen(an, h); }
+@@ -60,6 +67,8 @@ void aflnet_update_ipsm(afl_state_t *afl
+ 
+   }
+ 
++  if (an->state_ids_count > states_before) { aflnet_write_ipsm_json(afl); }
++
+ }
+ 
+ /* Per-run state feedback: fold the state sequence into the coverage
+diff --color -rup ./aflnet-pp/src/aflnet/module.c /home/shiyinghao/aflnet-pp/src/aflnet/module.c
+--- ./aflnet-pp/src/aflnet/module.c	2026-09-01 19:00:52.000000000 +0800
++++ /home/shiyinghao/aflnet-pp/src/aflnet/module.c	2026-10-14 02:06:07.326032026 +0800
+@@ -79,14 +79,30 @@ static void aflnet_module_deinit(void *d
+ }
+ 
+ /* post-fuzz: called by fuzz_run_target() after every target execution.
+-   Folds the per-run state sequence into the coverage bitmap and updates the
+-   IPSM.  Like every afl_custom_post_run this fires for any forkserver run,
+-   INCLUDING the optional SAN forkservers.  Only the main forkserver run
+-   performs a network exchange (the module's late_send ->
+-   aflnet_send_over_network sets feedback_pending); SAN runs re-execute the
+-   target with the same input but no exchange, so feedback_pending is 0 there
+-   and we skip them - otherwise they would re-derive the stale response and
+-   double-count fuzzs / re-fold state transitions into trace_bits. */
++   Two things happen here, in this order:
++
++     1. the shared sockhook session is re-armed for the NEXT run.  post_run()
++        is the last hook the core calls after an execution and before the
++        next fork, so the rendezvous state (turn token, is_end,
++        connection_state, message lengths, futex) is clean again by the time
++        the next child looks at it - and, unlike late_send
++        (aflnet_module_fuzz_send -> aflnet_send_over_network), it does not
++        race a child that has already armed the session.  This is the fuzzer
++        half of the per-run reset that the target's own session_init() cannot
++        perform for a process that serves more than one session without
++        re-arming (a persistent target looping on accept()).
++
++     2. the per-run state feedback: fold the state sequence into the coverage
++        bitmap and update the IPSM.  Like every afl_custom_post_run this
++        fires for any forkserver run, INCLUDING the optional SAN forkservers.
++        Only the main forkserver run performs a network exchange (the module's
++        late_send -> aflnet_send_over_network sets feedback_pending); SAN runs
++        re-execute the target with the same input but no exchange, so
++        feedback_pending is 0 there and we skip the feedback - otherwise they
++        would re-derive the stale response and double-count fuzzs / re-fold
++        state transitions into trace_bits.  The reset in step 1 runs for
++        those runs as well: re-arming an idle session is idempotent, and it
++        also cleans up whatever a SAN child may have armed. */
+ static void aflnet_module_post_run(void *data) {
+ 
+   aflnet_module_ctx_t *ctx = (aflnet_module_ctx_t *)data;
+@@ -94,6 +110,18 @@ static void aflnet_module_post_run(void
+ 
+   if (!afl->afl_env.aflnet_mode) { return; }
+ 
++  /* re-arm the shared session for the next run.  The function pointer is
++     assigned in config.c for the two shm-sync configurations and is NULL for
++     sock_mode=0; aflnet_sock2shm_init_session() itself no-ops unless the
++     segment rendezvous is armed.  It also resets the token/connection_state
++     left behind by a timed-out run, which is why the (never wired)
++     aflnet_sock2shm_notify_timeout() is not needed. */
++  if (afl->aflnet && afl->aflnet->aflnet_init_session) {
++
++    (void)afl->aflnet->aflnet_init_session(afl);
++
++  }
++
+   /* skip runs without a fresh network exchange (e.g. SAN forkservers) */
+   if (!afl->aflnet->feedback_pending) { return; }
+   afl->aflnet->feedback_pending = 0;
+diff --color -rup ./aflnet-pp/src/aflnet/net.c /home/shiyinghao/aflnet-pp/src/aflnet/net.c
+--- ./aflnet-pp/src/aflnet/net.c	2026-10-01 22:58:07.000000000 +0800
++++ /home/shiyinghao/aflnet-pp/src/aflnet/net.c	2026-10-22 02:36:27.824141840 +0800
+@@ -286,8 +286,10 @@ void aflnet_run_cleanup(afl_state_t *afl
+ /* The preloaded sockhook serialises the exchange from the target side: it
+    publishes "listening, ready to accept" from accept() and hands the turn
+    back from every recv().  The helpers below perform the matching
+-   client-side steps.  They are no-ops unless the standalone sync is armed,
+-   so sock_mode=0/1 without it and sock_mode=2 keep their exact behaviour. */
++   client-side steps through aflnet_state_t.sync_ops, which
++   aflnet_configure_from_env() fills with the implementation of the configured
++   sock mode (NULL when the mode has no rendezvous), so sock_mode=0/1 without
++   AFLNET_SHM_SYNC and sock_mode=2 keep their exact behaviour. */
+ 
+ /* wait (bounded) for the target to publish its readiness before dialling.
+    A target that is slow to start is not an error here: the plain connect
+@@ -296,16 +298,12 @@ static void net_sync_wait_server(afl_sta
+ 
+   static u8 warned = 0;
+ 
+-  /* the readiness handshake only exists for the standalone rendezvous on top
+-     of the real-socket exchange (sock_mode=1); in sock_mode=2 the readiness is
+-     implicit in the SHM turn-taking (the fuzzer waits for the target's turn
+-     before it reads), so the bounded wait is not applicable and must not warn
+-     about a signal that is never expected. */
+-  if (!afl->aflnet || afl->aflnet->sock_mode != AFLNET_SOCK) { return; }
++  /* Only the standalone rendezvous has a readiness handshake.  sock_mode=2
++     leaves sync_ops NULL (its readiness is implicit in the SHM turn-taking),
++     so nothing is waited for and nothing is warned about there. */
++  if (!afl->aflnet || !afl->aflnet->sync_ops) { return; }
+ 
+-  if (!aflnet_shm_sync_enabled(afl)) { return; }
+-
+-  if (!aflnet_shm_sync_wait_ready(afl) && !warned) {
++  if (!afl->aflnet->sync_ops->wait_ready(afl) && !warned) {
+ 
+     warned = 1;
+     WARNF("standalone sockhook sync: the target did not signal readiness in "
+@@ -324,7 +322,11 @@ static void net_sync_wait_server(afl_sta
+    flight. */
+ static void net_sync_hand_over(afl_state_t *afl) {
+ 
+-  aflnet_shm_sync_notify_request(afl);
++  if (afl->aflnet && afl->aflnet->sync_ops) {
++
++    afl->aflnet->sync_ops->notify_request(afl);
++
++  }
+ 
+ }
+ 
+@@ -334,7 +336,11 @@ static void net_sync_hand_over(afl_state
+    on the wire before the caller reads them. */
+ static void net_sync_wait_back(afl_state_t *afl) {
+ 
+-  (void)aflnet_shm_sync_wait_response(afl);
++  if (afl->aflnet && afl->aflnet->sync_ops) {
++
++    (void)afl->aflnet->sync_ops->wait_response(afl);
++
++  }
+ 
+ }
+ 
+@@ -381,7 +387,7 @@ void aflnet_send_over_network(void *data
+ 
+   /* wait a bit for the server to finish initializing before the first send
+      (mirror original AFLNet -D, AFLNET_SERVER_WAIT_USECS) */
+-  if (an->server_wait_usecs && !afl->deferred_mode) { usleep(an->server_wait_usecs); }
++  if (an->server_wait_usecs && !afl->deferred_mode && !afl->aflnet->shm_sync) { usleep(an->server_wait_usecs); }
+ 
+   /* reset per-run response capture */
+   if (an->response_buf) {
+@@ -407,18 +413,12 @@ void aflnet_send_over_network(void *data
+   /* NOTE: the per-run session reset (an->aflnet_init_session) deliberately
+      does NOT run here - this function is reached only AFTER the forkserver
+      has spawned the target child (and the child may already have run
+-     bind()/accept()).  The reset has to arm the shared session state (turn
+-     token, session-end code, message lengths, connection_state) before the
+-     child looks at it: clearing it afterwards makes the child's check_fd()
+-     fail on the very connection it is accepting, so the accepted session fd
+-     is never registered in fd_map and the sock2shm SHM redirection silently
+-     falls back to the real socket for the whole run.
+-     The reset therefore has to happen in fuzz_run_target()
+-     (src/afl-fuzz-run.c), before the forkserver spawns the child, which is
+-     the only correct point.  OPEN ITEM: it is not wired up yet -
+-     an->aflnet_init_session is assigned in config.c but never invoked, so the
+-     two shared-state configurations currently run without it (see the note
+-     in utils/sockhook/README.md). */
++     bind()/accept()).  Clearing the shared state at this point would hit a
++     session the child has already armed.
++     The reset runs in the module's afl_custom_post_run() instead
++     (src/aflnet/module.c), i.e. after the previous run finished and before
++     the next fork - the same serialisation point the core would provide in
++     fuzz_run_target() (src/afl-fuzz-run.c), without a core edit. */
+ 
+   an->response_buf_size = 0;
+   an->messages_sent = 0;
+@@ -486,11 +486,9 @@ void aflnet_send_over_network(void *data
+ 
+   /* hand the socket to the per-message dispatch helpers.  The per-run
+      session reset (an->aflnet_init_session) deliberately does NOT happen
+-     here: it has to run BEFORE the forkserver spawns the target child, i.e.
+-     in fuzz_run_target() (src/afl-fuzz-run.c) - which does not call it yet
+-     (see the note above).  Resetting the shared session state at this point
+-     would hit a child that already armed its session, which silently
+-     disabled the sock2shm SHM redirection. */
++     here: it runs in the module's post_run for the *next* run (see the note
++     above).  Resetting the shared session state at this point would hit a
++     child that already armed its session. */
+   an->sockfd = sockfd;
+ 
+   /* capture the initial state of the exchange through the bound
+@@ -560,10 +558,10 @@ cleanup:
+ 
+   /* standalone sockhook sync: end the session before closing the socket so a
+      target whose recv() is parked on the SHM turn-taking returns immediately
+-     instead of waiting for the TCP close (or the run timeout).  Meant to be
+-     reset again by the next run's aflnet_init_session(), before the child is
+-     spawned - a call that is still missing (see above). */
+-  aflnet_shm_sync_notify_end(afl);
++     instead of waiting for the TCP close (or the run timeout).  A target
++     parked in the kernel recv() is released by the close() below; the next
++     run's shared state is re-armed by the module's post_run (see above). */
++  if (an->sync_ops) { an->sync_ops->notify_end(afl); }
+ 
+   close(sockfd);
+   an->sockfd = -1;
+diff --color -rup ./aflnet-pp/src/aflnet/state.c /home/shiyinghao/aflnet-pp/src/aflnet/state.c
+--- ./aflnet-pp/src/aflnet/state.c	2026-09-23 02:04:36.000000000 +0800
++++ /home/shiyinghao/aflnet-pp/src/aflnet/state.c	2026-10-21 23:22:17.173151471 +0800
+@@ -7,8 +7,6 @@
+ 
+ #include <stdlib.h>
+ #include <string.h>
+-#include <unistd.h>
+-#include <fcntl.h>
+ 
+ #include "config.h"
+ #include "types.h"
+@@ -52,16 +50,6 @@ void aflnet_expand_was_fuzzed_map(aflnet
+ 
+   an->was_fuzzed_map = (u8 **)ck_realloc(an->was_fuzzed_map,
+                                          new_state_count * sizeof(u8 *));
+-  /* ck_realloc() does not zero the memory it hands out (it is plain
+-     realloc()), so the row pointers added by this growth have to be
+-     initialised before they are reallocated below -- reading them as-is
+-     would pass a garbage pointer to realloc(). */
+-  for (u32 i = old_states; i < new_state_count; i++) {
+-
+-    an->was_fuzzed_map[i] = NULL;
+-
+-  }
+-
+   for (u32 i = 0; i < new_state_count; i++) {
+ 
+     an->was_fuzzed_map[i] =
+@@ -180,262 +168,109 @@ void aflnet_mark_path_seen(aflnet_state_
+ 
+ }
+ 
+-/* ------------------------------------------------------------------ */
+-/* IPSM update                                                        */
+-/* ------------------------------------------------------------------ */
++static void aflnet_record_edge(aflnet_state_t *an, u32 from, u32 to) {
+ 
+-/* Annotate the regions of q with per-region cumulative state subsequences.
+-   Both state_mode == AFLNET_RESP_CODE_MODE and state_mode == AFLNET_STATE_VAR_MODE produce the same structure: for
+-   region i the annotation is the cumulative subsequence of all state ids
+-   observed up to and including message i's response, i.e. its last element is
+-   the state that message i reached.  The backends differ in how many entries
+-   precede that last element and in the source of the state ids:
+-     - state_mode == AFLNET_RESP_CODE_MODE: extracted from response_buf via extract_response_codes; the
+-       greeting/initial response counts as one extra state, so region i has i + 3
+-     - state_mode == AFLNET_STATE_VAR_MODE: taken from state_sequence (one entry per recv, built
+-                        in real time by aflnet_send_over_network); the initial
+-                        response is folded into the first message's state, so
+-                        region i has i + 2 */
++  for (u32 i = 0; i < an->ipsm_edge_count; i++) {
+ 
+-static void aflnet_annotate_regions(afl_state_t *afl, struct queue_entry *q) {
+-
+-  aflnet_state_t *an = afl->aflnet;
+-
+-  if (!q || !q->regions || !q->region_count) { return; }
+-  if (!an->messages_sent) { return; }
++    if (an->ipsm_edges[i].from == from && an->ipsm_edges[i].to == to) {
+ 
+-  u32 sent = MIN(an->messages_sent, q->region_count);
+-
+-  for (u32 i = 0; i < sent; i++) {
+-
+-    /* free previous annotation */
+-    if (q->regions[i].state_sequence) {
+-
+-      ck_free(q->regions[i].state_sequence);
+-      q->regions[i].state_sequence = NULL;
+-      q->regions[i].state_count = 0;
+-
+-    }
+-
+-    /* ask the bound backend for region i's cumulative state subsequence:
+-       - response-code backend: extract from the cumulative response bytes
+-       - state-variable backend: copy state_sequence[0..i+1] */
+-    if (an->state_backend && an->state_backend->region_states) {
+-
+-      unsigned int cnt = 0;
+-      q->regions[i].state_sequence =
+-          an->state_backend->region_states(afl, i, &cnt);
+-      q->regions[i].state_count = cnt;
++      return;
+ 
+     }
+ 
+   }
+ 
+-}
+-/* Register a seed (and its region annotations) with the IPSM. */
+-
+-void aflnet_register_seed(afl_state_t *afl, struct queue_entry *q) {
+-
+-  aflnet_state_t *an = afl->aflnet;
++  if (an->ipsm_edge_count >= an->ipsm_edge_alloc) {
+ 
+-  if (!afl->afl_env.aflnet_mode || !q) { return; }
+-
+-  if (!an->state_sequence) { return; }
+-
+-  /* annotate the seed's regions from the most recent run's state
+-     sequence (both modes use the same annotation path; the per-mode
+-     differences are handled inside aflnet_annotate_regions) */
+-  aflnet_annotate_regions(afl, q);
+-
+-  /* every seed reaches the initial state */
+-  aflnet_ensure_state(an, 0);
+-
+-  if (q->id >= an->fuzzed_map_qentries) {
+-
+-    aflnet_expand_was_fuzzed_map(an, 0,
+-                                 q->id + 1 - an->fuzzed_map_qentries);
++    u32 new_alloc = an->ipsm_edge_alloc ? an->ipsm_edge_alloc * 2 : 64;
++    an->ipsm_edges = (aflnet_edge_t *)ck_realloc(
++        an->ipsm_edges, new_alloc * sizeof(aflnet_edge_t));
++    an->ipsm_edge_alloc = new_alloc;
+ 
+   }
+ 
+-  aflnet_state_add_seed(an, 0, q);
+-  an->was_fuzzed_map[aflnet_get_state_index(an, 0)][q->id] = 0;
+-
+-  /* register per-region reachability */
+-  for (u32 i = 0; i < q->region_count; i++) {
+-
+-    if (q->regions[i].state_count > 0) {
+-
+-      u32 reachable =
+-          q->regions[i].state_sequence[q->regions[i].state_count - 1];
+-
+-      aflnet_ensure_state(an, reachable);
+-      aflnet_state_add_seed(an, reachable, q);
+-
+-      u32 sidx = aflnet_get_state_index(an, reachable);
+-      if (sidx != (u32)-1) { an->was_fuzzed_map[sidx][q->id] = 0; }
+-
+-    }
+-
+-  }
++  an->ipsm_edges[an->ipsm_edge_count].from = from;
++  an->ipsm_edges[an->ipsm_edge_count].to = to;
++  an->ipsm_edge_count++;
+ 
+ }
+-/* Mark q as already fuzzed for the current target state.  Mirrors original
+-   AFLNet's fuzz_one: was_fuzzed_map[get_state_index(target_state_id)]
+-   [q->index] = 1.  Called by the core's abandon_entry after a seed finishes
+-   fuzzing, so the state-aware scheduler can skip it on later picks. */
+ 
+-void aflnet_mark_seed_fuzzed(afl_state_t *afl, struct queue_entry *q) {
++void aflnet_record_sequence_edges(aflnet_state_t *an, u32 *sequence,
++                                  u32 count) {
+ 
+-  aflnet_state_t *an = afl->aflnet;
+-  u32             sidx;
++  for (u32 i = 1; i < count; i++) {
+ 
+-  if (!afl->afl_env.aflnet_mode || !an || !q) { return; }
+-  if (!an->state_mode) { return; }
+-
+-  sidx = aflnet_get_state_index(an, an->target_state_id);
+-  if (sidx == (u32)-1) { return; }
+-
+-  if (q->id >= an->fuzzed_map_qentries) {
+-
+-    aflnet_expand_was_fuzzed_map(an, 0, q->id + 1 - an->fuzzed_map_qentries);
++    aflnet_record_edge(an, sequence[i - 1], sequence[i]);
+ 
+   }
+ 
+-  an->was_fuzzed_map[sidx][q->id] = 1;
+-
+ }
+ 
+-/* Return 1 if q has already been fuzzed for the current target state,
+-   0 otherwise (also 0 when state-aware mode is off / state unknown). */
++/* Publish the current IPSM without exposing a partially written file to
++   readers.  The temporary file is renamed over ipsm.json only after the
++   complete JSON document has been flushed. */
++void aflnet_write_ipsm_json(afl_state_t *afl) {
+ 
+-u8 aflnet_is_seed_fuzzed(afl_state_t *afl, struct queue_entry *q) {
+-
+-  aflnet_state_t *an = afl->aflnet;
+-  u32             sidx;
+-
+-  if (!afl->afl_env.aflnet_mode || !an || !q) { return 0; }
+-  if (!an->state_mode) { return 0; }
+-
+-  sidx = aflnet_get_state_index(an, an->target_state_id);
+-  if (sidx == (u32)-1) { return 0; }
+-  if (q->id >= an->fuzzed_map_qentries) { return 0; }
+-
+-  return an->was_fuzzed_map[sidx][q->id] == 1;
+-
+-}
+-
+-/* Increment the per-state fuzz counter for each distinct state visited by
+-   the most recent run's state sequence.  Mirrors original AFLNet's
+-   update_fuzzs(); called from feedback.c after every target execution.  The
+-   fuzzs counter feeds the FAVOR state score (scheduler.c). */
+-
+-void aflnet_update_fuzzs(afl_state_t *afl) {
++  if (!afl || !afl->aflnet || !afl->out_dir) { return; }
+ 
+   aflnet_state_t *an = afl->aflnet;
++  u8 *tmp = alloc_printf("%s/ipsm.json.tmp", afl->out_dir);
++  u8 *dst = alloc_printf("%s/ipsm.json", afl->out_dir);
++  FILE *fp = fopen((char *)tmp, "w");
+ 
+-  if (!afl->afl_env.aflnet_mode || !an) { return; }
+-  if (!an->state_sequence || !an->state_count) { return; }
++  if (!fp) {
+ 
+-  /* a local set avoids counting the same state more than once per run */
+-  u32 *seen = NULL;
+-  u32  seen_count = 0;
+-  u32  seen_alloc = 0;
+-
+-  for (u32 i = 0; i < an->state_count; i++) {
+-
+-    u32 state_id = an->state_sequence[i];
+-    u32 j;
+-    for (j = 0; j < seen_count; j++) {
+-
+-      if (seen[j] == state_id) { break; }
+-
+-    }
+-
+-    if (j < seen_count) { continue; }
+-
+-    if (seen_count >= seen_alloc) {
+-
+-      seen_alloc = seen_alloc ? seen_alloc * 2 : 16;
+-      seen = (u32 *)ck_realloc(seen, seen_alloc * sizeof(u32));
+-
+-    }
+-
+-    seen[seen_count++] = state_id;
+-
+-    u32 sidx = aflnet_get_state_index(an, state_id);
+-    if (sidx != (u32)-1) { an->states[sidx]->fuzzs++; }
++    WARNF("Unable to create IPSM snapshot '%s'", tmp);
++    ck_free(tmp);
++    ck_free(dst);
++    return;
+ 
+   }
+ 
+-  if (seen) { ck_free(seen); }
+-
+-}
+-
+-/* aflnet_update_ipsm() and aflnet_update_state_feedback() are the public
+-   IPSM entry points used by the rest of the fuzzer; they live in
+-   src/aflnet/feedback.c and call back into the helpers above. */
+-
++  fputs("{\n  \"states\": [\n", fp);
+ 
+-u32 aflnet_save_testcase_to_file(afl_state_t *afl, u8 *mem, u32 len, u8 *fname,
+-                                 u8 replay_enabled, u32 max_count) {
+-
+-  aflnet_state_t *an = afl->aflnet;
+-  region_t       *regions = NULL;
+-  unsigned int    region_count = 0;
+-  u8             *out = NULL;
+-  u32             out_len = 0, message_count = 0;
+-
+-  if (!an || !an->aflnet_extract_requests || !mem || !len) { return 0; }
+-
+-  regions = an->aflnet_extract_requests(mem, len, &region_count);
++  for (u32 i = 0; i < an->state_ids_count; i++) {
+ 
+-  s32 fd = open((char *)fname, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+-  if (fd < 0) { PFATAL("Unable to create file '%s'", fname); }
++    state_info_t *state = an->states[i];
+ 
+-  for (unsigned int i = 0; i < region_count && message_count < max_count; i++) {
++    fprintf(fp,
++            "    {\"id\": %u, \"covered\": %s, \"paths\": %u, "
++            "\"paths_discovered\": %u, \"selected_times\": %u, "
++            "\"fuzzs\": %u, \"score\": %u, \"seeds\": %u}%s\n",
++            state->id, state->is_covered ? "true" : "false", state->paths,
++            state->paths_discovered, state->selected_times, state->fuzzs,
++            state->score, state->seeds_count,
++            i + 1 < an->state_ids_count ? "," : "");
+ 
+-    u32 msg_size = (u32)(regions[i].end_byte - regions[i].start_byte + 1);
+-    if (!msg_size) { continue; }
++  }
+ 
+-    if (replay_enabled) {
++  fputs("  ],\n  \"edges\": [\n", fp);
+ 
+-      out = (u8 *)ck_realloc(out, out_len + 4 + msg_size);
++  for (u32 i = 0; i < an->ipsm_edge_count; i++) {
+ 
+-      /* save the packet size first (4 bytes, host byte order) */
+-      u32 *psize = (u32 *)&out[out_len];
+-      *psize = msg_size;
++    fprintf(fp, "    {\"from\": %u, \"to\": %u}%s\n",
++            an->ipsm_edges[i].from, an->ipsm_edges[i].to,
++            i + 1 < an->ipsm_edge_count ? "," : "");
+ 
+-      /* then the packet content */
+-      memcpy(&out[out_len + 4], mem + regions[i].start_byte, msg_size);
+-      out_len = out_len + 4 + msg_size;
++  }
+ 
+-    } else {
++  fputs("  ]\n}\n", fp);
+ 
+-      out = (u8 *)ck_realloc(out, out_len + msg_size);
+-      memcpy(&out[out_len], mem + regions[i].start_byte, msg_size);
+-      out_len = out_len + msg_size;
++  u8 write_failed = ferror(fp);
++  if (fclose(fp)) { write_failed = 1; }
+ 
+-    }
++  if (write_failed || rename((char *)tmp, (char *)dst)) {
+ 
+-    message_count++;
++    WARNF("Unable to update IPSM snapshot '%s'", dst);
++    unlink((char *)tmp);
+ 
+   }
+ 
+-  if (regions) { ck_free(regions); }
+-
+-  /* write everything & close the file (ck_write is a no-op when out_len==0) */
+-  ck_write(fd, out, out_len, fname);
+-  close(fd);
+-
+-  /* free the temporary buffer */
+-  if (out) { ck_free(out); }
+-
+-  return out_len;
++  ck_free(tmp);
++  ck_free(dst);
+ 
+ }
+ 
+-
+-
+ /* ------------------------------------------------------------------ */
+ /* state-sequence backends                                            */
+ /* ------------------------------------------------------------------ */
+@@ -546,3 +381,262 @@ void aflnet_state_bind_backend(afl_state
+   }
+ 
+ }
++
++/* ------------------------------------------------------------------ */
++/* IPSM update                                                        */
++/* ------------------------------------------------------------------ */
++
++/* Annotate the regions of q with per-region cumulative state subsequences.
++   Both state_mode == AFLNET_RESP_CODE_MODE and state_mode == AFLNET_STATE_VAR_MODE produce the same structure: for
++   region i the annotation is the cumulative subsequence of all state ids
++   observed up to and including message i's response.  The only difference is
++   the source of the state ids:
++     - state_mode == AFLNET_RESP_CODE_MODE: extracted from response_buf via extract_response_codes
++     - state_mode == AFLNET_STATE_VAR_MODE: taken from state_sequence (one entry per recv, built
++                        in real time by aflnet_send_over_network) */
++
++static void aflnet_annotate_regions(afl_state_t *afl, struct queue_entry *q) {
++
++  aflnet_state_t *an = afl->aflnet;
++
++  if (!q || !q->regions || !q->region_count) { return; }
++  if (!an->messages_sent) { return; }
++
++  u32 sent = MIN(an->messages_sent, q->region_count);
++
++  for (u32 i = 0; i < sent; i++) {
++
++    /* free previous annotation */
++    if (q->regions[i].state_sequence) {
++
++      ck_free(q->regions[i].state_sequence);
++      q->regions[i].state_sequence = NULL;
++      q->regions[i].state_count = 0;
++
++    }
++
++    /* ask the bound backend for region i's cumulative state subsequence:
++       - response-code backend: extract from the cumulative response bytes
++       - state-variable backend: copy state_sequence[0..i] */
++    if (an->state_backend && an->state_backend->region_states) {
++
++      unsigned int cnt = 0;
++      q->regions[i].state_sequence =
++          an->state_backend->region_states(afl, i, &cnt);
++      q->regions[i].state_count = cnt;
++
++    }
++
++  }
++
++}
++
++/* Count the states visited by the latest run.  A state is counted once per
++   run even when the sequence revisits it. */
++void aflnet_update_fuzzs(afl_state_t *afl) {
++
++  aflnet_state_t *an = afl->aflnet;
++  if (!an || !an->state_sequence) { return; }
++
++  for (u32 i = 0; i < an->state_count; i++) {
++
++    u8 seen = 0;
++    for (u32 j = 0; j < i; j++) {
++
++      if (an->state_sequence[j] == an->state_sequence[i]) {
++
++        seen = 1;
++        break;
++
++      }
++
++    }
++
++    if (seen) { continue; }
++
++    u32 sidx = aflnet_get_state_index(an, an->state_sequence[i]);
++    if (sidx != (u32)-1) { an->states[sidx]->fuzzs++; }
++
++  }
++
++}
++
++/* Register a seed (and its region annotations) with the IPSM. */
++
++void aflnet_register_seed(afl_state_t *afl, struct queue_entry *q) {
++
++  aflnet_state_t *an = afl->aflnet;
++
++  if (!afl->afl_env.aflnet_mode || !q) { return; }
++
++  if (!an->state_sequence) { return; }
++
++  /* annotate the seed's regions from the most recent run's state
++     sequence (both modes use the same annotation path; the per-mode
++     differences are handled inside aflnet_annotate_regions) */
++  aflnet_annotate_regions(afl, q);
++
++  /* every seed reaches the initial state */
++  aflnet_ensure_state(an, 0);
++
++  if (q->id >= an->fuzzed_map_qentries) {
++
++    aflnet_expand_was_fuzzed_map(an, 0,
++                                 q->id + 1 - an->fuzzed_map_qentries);
++
++  }
++
++  aflnet_state_add_seed(an, 0, q);
++  an->was_fuzzed_map[aflnet_get_state_index(an, 0)][q->id] = 0;
++
++  /* register per-region reachability */
++  for (u32 i = 0; i < q->region_count; i++) {
++
++    if (q->regions[i].state_count > 0) {
++
++      u32 reachable =
++          q->regions[i].state_sequence[q->regions[i].state_count - 1];
++
++      aflnet_ensure_state(an, reachable);
++      aflnet_state_add_seed(an, reachable, q);
++
++      u32 sidx = aflnet_get_state_index(an, reachable);
++      if (sidx != (u32)-1) { an->was_fuzzed_map[sidx][q->id] = 0; }
++
++    }
++
++  }
++
++}
++
++/* Record that q has been fuzzed for the currently targeted state.  The map
++   is sparse and may lag behind queue IDs imported from another instance. */
++void aflnet_mark_seed_fuzzed(afl_state_t *afl, struct queue_entry *q) {
++
++  if (!afl || !afl->afl_env.aflnet_mode || !afl->aflnet || !q) { return; }
++
++  aflnet_state_t *an = afl->aflnet;
++  if (!an->state_mode) { return; }
++
++  u32 sidx = aflnet_get_state_index(an, an->target_state_id);
++  if (sidx == (u32)-1) { return; }
++
++  if (q->id >= an->fuzzed_map_qentries) {
++
++    aflnet_expand_was_fuzzed_map(an, 0,
++                                 q->id + 1 - an->fuzzed_map_qentries);
++
++  }
++
++  an->was_fuzzed_map[sidx][q->id] = 1;
++
++}
++
++/* Whether q has already been fuzzed for the currently targeted state. */
++u8 aflnet_is_seed_fuzzed(afl_state_t *afl, struct queue_entry *q) {
++
++  if (!afl || !afl->afl_env.aflnet_mode || !afl->aflnet || !q) { return 0; }
++
++  aflnet_state_t *an = afl->aflnet;
++  if (!an->state_mode) { return 0; }
++
++  u32 sidx = aflnet_get_state_index(an, an->target_state_id);
++  if (sidx == (u32)-1 || q->id >= an->fuzzed_map_qentries) { return 0; }
++
++  return an->was_fuzzed_map[sidx][q->id] == 1;
++
++}
++
++/* Save the first max_count messages of a test case.  In replay mode each
++   message gets the native 4-byte length prefix consumed by aflnet-replay;
++   otherwise the selected messages are concatenated unchanged. */
++u32 aflnet_save_testcase_to_file(afl_state_t *afl, u8 *mem, u32 len,
++                                 u8 *fname, u8 replay_enabled, u32 max_count) {
++
++  if (!afl || !afl->aflnet || !afl->aflnet->aflnet_extract_requests || !mem ||
++      !len || !fname || !max_count) {
++
++    return 0;
++
++  }
++
++  unsigned int region_count = 0;
++  region_t    *regions = afl->aflnet->aflnet_extract_requests(
++      mem, len, &region_count);
++
++  if (!regions || !region_count) {
++
++    if (regions) { ck_free(regions); }
++    return 0;
++
++  }
++
++  u32 write_count = MIN(region_count, max_count);
++  int fd = open((char *)fname, O_WRONLY | O_CREAT | O_TRUNC, 0600);
++
++  if (fd < 0) {
++
++    ck_free(regions);
++    PFATAL("Unable to create '%s'", fname);
++
++  }
++
++  u32 bytes_written = 0;
++
++  for (u32 i = 0; i < write_count; i++) {
++
++    if (regions[i].start_byte < 0 || regions[i].end_byte <
++                                          regions[i].start_byte ||
++        (u32)regions[i].end_byte >= len) {
++
++      continue;
++
++    }
++
++    u32 msg_len = (u32)regions[i].end_byte -
++                  (u32)regions[i].start_byte + 1;
++
++    if (replay_enabled) {
++
++      ck_write(fd, &msg_len, sizeof(msg_len), fname);
++      bytes_written += sizeof(msg_len);
++
++    }
++
++    ck_write(fd, mem + regions[i].start_byte, msg_len, fname);
++    bytes_written += msg_len;
++
++  }
++
++  close(fd);
++  ck_free(regions);
++  return bytes_written;
++
++}
++
++void aflnet_save_replayable_fault(afl_state_t *afl, u8 *mem, u32 len,
++                                  const u8 *raw_fname, u8 is_crash) {
++
++  if (!afl || !afl->afl_env.aflnet_mode || !afl->aflnet || !mem || !len ||
++      !raw_fname || !afl->aflnet->messages_sent) {
++
++    return;
++
++  }
++
++  const char *raw_name = strrchr((const char *)raw_fname, '/');
++  raw_name = raw_name ? raw_name + 1 : (const char *)raw_fname;
++
++  u8 *replay_fname =
++      alloc_printf("%s/%s/%s", afl->out_dir,
++                   is_crash ? "replayable-crashes" : "replayable-hangs",
++                   raw_name);
++  aflnet_save_testcase_to_file(afl, mem, len, replay_fname, 1,
++                               afl->aflnet->messages_sent);
++  ck_free(replay_fname);
++
++}
++
++/* aflnet_update_ipsm() and aflnet_update_state_feedback() are the public
++   IPSM entry points used by the rest of the fuzzer; they live in
++   src/afl-fuzz-aflnet.c and call back into the helpers above. */
+diff --color -rup ./aflnet-pp/src/aflnet/utils/sock2shm.c /home/shiyinghao/aflnet-pp/src/aflnet/utils/sock2shm.c
+--- ./aflnet-pp/src/aflnet/utils/sock2shm.c	2026-10-01 22:54:20.000000000 +0800
++++ /home/shiyinghao/aflnet-pp/src/aflnet/utils/sock2shm.c	2026-10-22 23:12:28.544311326 +0800
+@@ -231,8 +231,17 @@ static void sock_shm_segments_setup(cons
+ 
+   }
+ 
+-  /* init the per-session fields of the check segment (the shared shm_sig) */
++  /* init the per-session fields of the check segment (the shared shm_sig).
++     Zero is NOT a neutral state: connection_state == 0 is ENDING and a zero
++     futex avail looks locked.  Start from the same state the target's
++     session_init() will use, so the first run's readiness wait really waits
++     for the target instead of being satisfied by the zero fill. */
+   memset(sign_ptr, 0, sizeof(*sign_ptr));
++  /* both modes start with the server's turn (see sockhook's session_init) */
++  shm_notify(&sign_ptr->state, SERVER);
++  atomic_store(&sign_ptr->connection_state, UNINITIALIZED);
++  sign_ptr->mx.avail = 1;
++  sign_ptr->mx.waiters = 0;
+ 
+   /* optional wait-time override (HNPFuzzer's -L option) */
+   wt = getenv("AFLNET_SOCK2SHM_WAIT_TIME");
+@@ -289,32 +298,27 @@ void aflnet_sock_shm_sync_setup(afl_stat
+ 
+ /* 1 when the sockhook rendezvous is armed for this run: sock_mode=2, or
+    sock_mode=1 with AFLNET_SHM_SYNC=1 and the control segment in place (the
+-   data segment is optional - the rendezvous never uses it). */
+-int aflnet_shm_sync_enabled(afl_state_t *afl) {
++   data segment is optional - the rendezvous never uses it).  Used by
++   aflnet_sock2shm_init_session() to gate the per-run reset; the
++   sock_mode=1 driver itself is selected through aflnet_state_t.sync_ops. */
++static int aflnet_shm_sync_armed(afl_state_t *afl) {
+ 
+   return afl->afl_env.aflnet_mode && afl->aflnet && afl->aflnet->shm_sync &&
+          sign_ptr != NULL;
+ 
+ }
+ 
+-/* 1 when the sync is armed on top of the plain real-socket interaction
+-   (sock_mode=1), i.e. the messages still travel over the socket and the sync
+-   helpers below are the ones that must drive the turn-taking. */
+-static int shm_sync_socket_mode(afl_state_t *afl) {
+-
+-  return aflnet_shm_sync_enabled(afl) &&
+-         afl->aflnet->sock_mode == AFLNET_SOCK;
+-
+-}
+-
+ /* Wait for the target to reach accept() (it publishes RUNNING on the check
+    segment before it blocks in accept).  Returns 1 when the target signalled
+    that it is ready for connections, 0 when the sync is off or the signal did
+    not arrive within waiting_time - the caller then keeps the plain connect
+-   retry behaviour. */
+-int aflnet_shm_sync_wait_ready(afl_state_t *afl) {
++   retry behaviour.  Installed as sync_ops->wait_ready for sock_mode=1 +
++   AFLNET_SHM_SYNC=1 (see config.c); a no-op when the segment is gone. */
++static int aflnet_shm_sync_wait_ready(afl_state_t *afl) {
++
++  (void)afl;   /* the state lives in the shared segment, not in afl_state_t */
+ 
+-  if (!shm_sync_socket_mode(afl) || !sign_ptr) { return 0; }
++  if (!sign_ptr) { return 0; }
+ 
+   return !shm_wait(&sign_ptr->connection_state, UNINITIALIZED, waiting_time);
+ 
+@@ -322,9 +326,11 @@ int aflnet_shm_sync_wait_ready(afl_state
+ 
+ /* Hand the next request over: the target's real-socket recv waits for this
+    before it reads (it mirrors the data1 handover of sock_mode=2). */
+-void aflnet_shm_sync_notify_request(afl_state_t *afl) {
++static void aflnet_shm_sync_notify_request(afl_state_t *afl) {
++
++  (void)afl;
+ 
+-  if (!shm_sync_socket_mode(afl) || !sign_ptr) { return; }
++  if (!sign_ptr) { return; }
+ 
+   shm_notify(&sign_ptr->state, SERVER);
+ 
+@@ -334,9 +340,11 @@ void aflnet_shm_sync_notify_request(afl_
+    socket and found nothing more to send.  Bounded by waiting_time: on
+    timeout the caller falls back to the plain socket poll.  Returns 1 when the
+    target signalled. */
+-int aflnet_shm_sync_wait_response(afl_state_t *afl) {
++static int aflnet_shm_sync_wait_response(afl_state_t *afl) {
+ 
+-  if (!shm_sync_socket_mode(afl) || !sign_ptr) { return 0; }
++  (void)afl;
++
++  if (!sign_ptr) { return 0; }
+ 
+   return !shm_wait(&sign_ptr->state, SERVER, waiting_time);
+ 
+@@ -347,9 +355,11 @@ int aflnet_shm_sync_wait_response(afl_st
+    reading instead of waiting for the TCP close / the run timeout.
+    aflnet_sock2shm_init_session() clears is_end again before the next child is
+    spawned, so this only affects the run being finished. */
+-void aflnet_shm_sync_notify_end(afl_state_t *afl) {
++static void aflnet_shm_sync_notify_end(afl_state_t *afl) {
+ 
+-  if (!shm_sync_socket_mode(afl) || !sign_ptr) { return; }
++  (void)afl;
++
++  if (!sign_ptr) { return; }
+ 
+   sign_ptr->is_end = 1;
+ 
+@@ -377,7 +387,7 @@ void aflnet_sock2shm_deinit(afl_state_t
+    the connection_state arm is what the target's accept() waits for. */
+ int aflnet_sock2shm_init_session(afl_state_t *afl) {
+ 
+-  if (!aflnet_shm_sync_enabled(afl)) {
++  if (!aflnet_shm_sync_armed(afl)) {
+ 
+     return 0;
+ 
+@@ -387,12 +397,11 @@ int aflnet_sock2shm_init_session(afl_sta
+      "session armed" flag is NOT here anymore - every target process keeps its
+      own mark (global_session_mark.session_inited in utils/sockhook), which a
+      fork copies like the rest of the memory image, so the fuzzer only has to
+-     reset the state that is really shared across processes.  The turn token
+-     decides who speaks first: sock_mode=2 starts with the target's turn (it
+-     reads the request from SHM), the real-socket sync starts with the
+-     client's, because the target's recv waits for the fuzzer to send. */
+-  shm_notify(&sign_ptr->state,
+-             afl->aflnet->sock_mode == AFLNET_SOCK2SHM ? SERVER : CLIENT);
++     reset the state that is really shared across processes.  Both modes start
++     with the server's turn: the target may publish a banner, then its first
++     recv yields CLIENT and waits for the fuzzer's request (see the target's
++     session_init()/recv_state_trans()). */
++  shm_notify(&sign_ptr->state, SERVER);
+   sign_ptr->is_end = 0;
+   /* sign_ptr->is_init is RESERVED (ABI only): the target no longer reads it */
+   sign_ptr->mx.avail = 1;
+@@ -429,7 +438,7 @@ int aflnet_sock2shm_init_session(afl_sta
+    FSRV_RUN_TMOUT so a still-running server ends its session cleanly. */
+ void aflnet_sock2shm_notify_timeout(afl_state_t *afl) {
+ 
+-  if (!aflnet_shm_sync_enabled(afl)) {
++  if (!aflnet_shm_sync_armed(afl)) {
+ 
+     return;
+ 
+@@ -454,15 +463,35 @@ void aflnet_sock2shm_notify_timeout(afl_
+ static int s2s_shm_read(char **response_buf, int *response_buf_size) {
+ 
+   int remain;
++  static u8 warned_stall = 0;
+ 
+-  /* the target did not signal a response within waiting_time: like a socket
+-     read that returns no data (poll timeout), report "nothing, not an
+-     error" - a request-driven server may simply not have replied yet. */
+-  if (shm_wait(&sign_ptr->state, SERVER, waiting_time)) { return 0; }
++  /* The target did not hand the response turn back within waiting_time.  A
++     request-driven server may legitimately not reply yet, so this stays "no
++     data" - but a session that is already marked ended is a hard error, and
++     the stall is reported once instead of being silently indistinguishable
++     from an empty response. */
++  if (shm_wait(&sign_ptr->state, SERVER, waiting_time)) {
++
++    if (!warned_stall) {
++
++      warned_stall = 1;
++      WARNF("sock2shm: target did not hand the response turn back within %d "
++            "ms (request-driven target or stalled session?)",
++            waiting_time);
++
++    }
++
++    return sign_ptr->is_end ? 1 : 0;
++
++  }
+ 
+   /* the target signalled CLIENT but has no bytes queued (e.g. it is idle,
+-     waiting for the next request): again no data, not an error. */
+-  if (session_msg->len2 == 0) { return 0; }
++     waiting for the next request): again no data, not an error, unless the
++     session is known to be over. */
++  if (session_msg->len2 == 0) { return sign_ptr->is_end ? 1 : 0; }
++
++  /* len2 > 0: drain it even when is_end was set - the target's close path
++     flushes the pending response before it publishes the end. */
+ 
+   *response_buf =
+       (char *)ck_realloc(*response_buf, *response_buf_size + session_msg->len2);
+@@ -484,7 +513,26 @@ static int s2s_shm_read(char **response_
+       session_msg->len2 -= MAX_MSG_SIZE;
+       *response_buf_size += MAX_MSG_SIZE;
+       shm_notify(&sign_ptr->state, SERVER);
+-      shm_wait(&sign_ptr->state, SERVER, waiting_time);
++
++      if (shm_wait(&sign_ptr->state, SERVER, waiting_time)) {
++
++        /* the target never took the previous chunk: do not keep reading the
++           shared buffer as if the transfer were still healthy */
++        sign_ptr->is_end = 3;
++        shm_notify(&sign_ptr->state, SERVER);
++
++        if (!warned_stall) {
++
++          warned_stall = 1;
++          WARNF("sock2shm: target stalled while draining a response chunk "
++                "(waiting_time=%d ms)",
++                waiting_time);
++
++        }
++
++        return 1;
++
++      }
+ 
+     }
+ 
+@@ -500,6 +548,7 @@ static int s2s_shm_write(char *mem, unsi
+ 
+   int remain;
+   int p;
++  static u8 warned_stall = 0;
+ 
+   /* Wait for the write floor: the target must have drained the previous
+      request and signalled readiness (state != SERVER) before we may touch
+@@ -509,7 +558,26 @@ static int s2s_shm_write(char *mem, unsi
+      target was still reading it.  On a real timeout do not write: bail out
+      with 0 bytes so the caller stops this exchange instead of corrupting
+      the shared buffer. */
+-  if (shm_wait(&sign_ptr->state, SERVER, waiting_time)) { return 0; }
++  if (shm_wait(&sign_ptr->state, SERVER, waiting_time)) {
++
++    /* We cannot write the request at all.  Returning 0 used to look like a
++       normal short send and the whole run was silently discarded; mark the
++       session dead (releasing the target) and report the stall once. */
++    sign_ptr->is_end = 8;
++    shm_notify(&sign_ptr->state, SERVER);
++
++    if (!warned_stall) {
++
++      warned_stall = 1;
++      WARNF("sock2shm: target did not take the request turn within %d ms; "
++            "marking the session failed",
++            waiting_time);
++
++    }
++
++    return -1;
++
++  }
+   if (sign_ptr->is_end) { return -1; }
+ 
+   session_msg->len1 = len;
+@@ -798,15 +866,13 @@ void aflnet_sock_shm_sync_setup(afl_stat
+ 
+ }
+ 
+-int aflnet_shm_sync_enabled(afl_state_t *afl) { return 0; }
+-
+-int aflnet_shm_sync_wait_ready(afl_state_t *afl) { return 0; }
++static int aflnet_shm_sync_wait_ready(afl_state_t *afl) { (void)afl; return 0; }
+ 
+-void aflnet_shm_sync_notify_request(afl_state_t *afl) { }
++static void aflnet_shm_sync_notify_request(afl_state_t *afl) { (void)afl; }
+ 
+-int aflnet_shm_sync_wait_response(afl_state_t *afl) { return 0; }
++static int aflnet_shm_sync_wait_response(afl_state_t *afl) { (void)afl; return 0; }
+ 
+-void aflnet_shm_sync_notify_end(afl_state_t *afl) { }
++static void aflnet_shm_sync_notify_end(afl_state_t *afl) { (void)afl; }
+ 
+ void aflnet_sock2shm_deinit(afl_state_t *afl) { }
+ 
+@@ -839,3 +905,15 @@ int aflnet_sock2shm_recv_msg(afl_state_t
+ int aflnet_sock2shm_active(afl_state_t *afl) { return 0; }
+ 
+ #endif /* __linux__ */
++
++/* The standalone sockhook rendezvous, installed in aflnet_state_t.sync_ops by
++   aflnet_configure_from_env() for sock_mode=1 + AFLNET_SHM_SYNC=1.  On
++   non-Linux the functions above are inert stubs, so the table is harmless. */
++const aflnet_sync_ops_t aflnet_shm_sync_ops = {
++
++    .wait_ready = aflnet_shm_sync_wait_ready,
++    .notify_request = aflnet_shm_sync_notify_request,
++    .wait_response = aflnet_shm_sync_wait_response,
++    .notify_end = aflnet_shm_sync_notify_end,
++
++};

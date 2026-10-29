@@ -100,6 +100,9 @@ void afl_state_init(afl_state_t *afl, uint32_t map_size) {
   afl->ijon_input_len = 0;
   afl->is_doing_ijon = 0;
 
+  /* Initialize AFLNet State */
+  afl->aflnet = (struct aflnet_state *)ck_alloc(sizeof(struct aflnet_state));
+
   afl->perm = DEFAULT_PERMISSION;
   afl->dir_perm = DEFAULT_DIRS_PERMISSION;
 
@@ -886,6 +889,8 @@ void read_afl_environment(afl_state_t *afl, char **envp) {
 
   }
 
+  aflnet_configure_from_env(afl);  
+
   if (issue_detected) { sleep(2); }
 
 }
@@ -939,6 +944,9 @@ void afl_state_deinit(afl_state_t *afl) {
   ck_free(afl->clean_trace_custom);
   ck_free(afl->first_trace);
   ck_free(afl->map_tmp_buf);
+
+  /* AFLNet state-aware (IPSM) state */
+  if (afl->afl_env.aflnet_mode) { aflnet_state_deinit(afl); }
 
   /* Free IJON max tracking state */
   if (afl->ijon_state) {

@@ -486,6 +486,28 @@ static void usage(u8 *argv0, int more_help) {
       "AFL_POST_PROCESS_KEEP_ORIGINAL: save the file as it was prior post-processing to\n"
       "                                the queue, but execute the post-processed one\n"
       "AFL_PRELOAD: LD_PRELOAD / DYLD_INSERT_LIBRARIES settings for target\n"
+      "AFLNET_URL: AFLNet target URL, e.g. tcp://127.0.0.1/8554 (AFLNet style),\n"
+      "            tcp://127.0.0.1:8554 or 127.0.0.1:8554\n"
+      "AFLNET_PROTOCOL: protocol name for AFLNet mode when AFLNET_URL has no scheme\n"
+      "AFLNET_SOCK_MODE: socket interaction mode (the fuzzer forwards it to\n"
+      "                the preloaded sockhook.so as __AFL_SOCK_MODE):\n"
+      "                0=libaflppdesock (testcase via stdin), 1=default AFLNet\n"
+      "                real-socket server (sockhook inert, default), 2=sock2shm\n"
+      "                (sockhook redirects the session I/O through shared SHM)\n"
+      "AFLNET_SOCKHOOK_PATH: path to sockhook.so, preloaded into the target for\n"
+      "                the server modes (default ./sockhook.so); legacy\n"
+      "                AFLNET_SOCK2SHM_PATH is also accepted\n"
+      "AFLNET_SOCK2SHM_WAIT_TIME: SHM futex wait timeout in ms for sock_mode=2 (default 100)\n"
+      "AFLNET_STATE_MODE: 0=disable state-aware scheduling, 1=response-code\n"
+      "                   feedback (default), 2=state-variable feedback via SHM\n"
+      "AFLNET_STATE_SELECTION: 1=random, 2=round-robin, 3=favor (default 2)\n"
+      "AFLNET_SEED_SELECTION: 1=random, 2=round-robin, 3=favor (default 1)\n"
+      "AFLNET_FEEDBACK: 1=code, 2=state, 3=code+state (default 3)\n"
+      "AFLNET_CLEANUP_SCRIPT: script to clean the server environment before each\n"
+      "                target execution (e.g., clear the FTP share directory)\n"
+      "AFLNET_TERMINATE_CHILD: SIGTERM the target child after each exchange so\n"
+      "                stateful servers start fresh (AFLNet -K, default 0).\n"
+      "                That SIGTERM death counts as a normal run, not a crash\n"
       "AFL_TARGET_ENV: pass extra environment variables to target\n"
       "AFL_SHUFFLE_QUEUE: reorder the input queue randomly on startup\n"
       "AFL_SKIP_BIN_CHECK: skip afl compatibility checks, also disables auto map size\n"
@@ -508,6 +530,11 @@ static void usage(u8 *argv0, int more_help) {
       "                      afl-clang-lto/afl-gcc-fast target\n"
       "AFL_PERSISTENT: enforce persistent mode (if __AFL_LOOP is in a shared lib)\n"
       "AFL_DEFER_FORKSRV: enforced deferred forkserver (__AFL_INIT is in a shared lib)\n"
+      "AFLNET_DEFER_FORKSRV: AFLNet deferred forkserver switch, value aware:\n"
+      "                      1=start the forkserver at the server's first\n"
+      "                      listen()/bind() (opt-in optimisation),\n"
+      "                      0=native constructor forkserver, as in original\n"
+      "                      AFLNet (unset = native = default)\n"
       "AFL_FUZZER_STATS_UPDATE_INTERVAL: interval to update fuzzer_stats file in\n"
       "                                  seconds (default: 60, minimum: 1)\n"
       "\n"
@@ -2333,6 +2360,13 @@ void afl_setup_environment(afl_state_t *afl) {
   }
 
   setup_custom_mutators(afl);
+
+
+  /* AFLNet: register the network module as a custom mutator.  It sets
+     AFL_CUSTOM_MUTATOR_LATE_SEND and provides afl_custom_fuzz_send, so the
+     stock late-send binding below binds its send to fsrv.late_send (this
+     replaces the former hard-coded aflnet_send_over_network assignment). */
+  aflnet_register_module(afl);
 
   if (afl->afl_env.afl_custom_mutator_only) {
 

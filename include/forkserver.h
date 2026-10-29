@@ -142,6 +142,11 @@ typedef struct afl_forkserver {
 
   u8 last_kill_signal;                  /* Signal that killed the child     */
 
+  u8 child_killed_by_fuzzer;            /* AFLNet -K/AFLNET_TERMINATE_CHILD:
+                                           *the fuzzer* SIGTERM'ed the child
+                                           this run, so that death must not
+                                           be counted as a crash            */
+
   u8 last_exit_code;               /* Child exit code if counted as a crash */
 
   bool allow_cores;                   /* allow core files on target crashes */

@@ -769,6 +769,10 @@ void add_to_queue(afl_state_t *afl, u8 *fname, u32 len, u8 passed_det) {
 
   q->fname = fname;
   q->len = len;
+  q->regions = NULL;
+  q->region_count = 0;
+  q->generating_state_id = afl->aflnet->target_state_id;
+  q->is_initial_seed = 0;
 
   q->depth = afl->cur_depth + 1;
   q->passed_det = passed_det;
@@ -872,6 +876,38 @@ void add_to_queue(afl_state_t *afl, u8 *fname, u32 len, u8 passed_det) {
 
   q->skipdet_e = (struct skipdet_entry *)ck_alloc(sizeof(struct skipdet_entry));
 
+  if (likely(afl->afl_env.aflnet_mode)) {
+
+    if (unlikely(!afl->aflnet->aflnet_extract_requests)) {
+      FATAL("AFLNet mode is enabled but no request extractor was selected");
+    }
+
+    /* a new path/seed was found: reset the hybrid-schedule clock so the
+       fuzzer stays code-aware right after a find (mirrors original AFLNet's
+       add_to_queue -> last_path_time = get_cur_time()) */
+    afl->aflnet->last_path_time = get_cur_time();
+
+    FILE *fp = fopen((char *)fname, "rb");
+    if (!fp) { PFATAL("Unable to open '%s'", fname); }
+
+    u8 *buf = (u8 *)ck_alloc(len);
+    u32 bytes_read = fread(buf, 1, len, fp);
+    fclose(fp);
+
+    if (bytes_read != len) {
+      PFATAL("AFLNet - inconsistent file length '%s'", fname);
+    }
+
+    q->regions =
+        afl->aflnet->aflnet_extract_requests(buf, len, &q->region_count);
+    ck_free(buf);
+
+    if (!q->regions && len) {
+      FATAL("AFLNet request extraction failed for '%s'", fname);
+    }
+
+  }
+
 }
 
 /* Destroy the entire queue. */
@@ -887,6 +923,18 @@ void destroy_queue(afl_state_t *afl) {
     ck_free(q->testcase_buf);
     ck_free(q->fname);
     ck_free(q->trace_mini);
+    if (q->regions) {
+
+      u32 j;
+      for (j = 0; j < q->region_count; j++) {
+
+        if (q->regions[j].state_sequence) { ck_free(q->regions[j].state_sequence); }
+
+      }
+
+      ck_free(q->regions);
+
+    }
     if (q->skipdet_e) {
 
       if (q->skipdet_e->done_inf_map) ck_free(q->skipdet_e->done_inf_map);
@@ -1109,16 +1157,40 @@ inline void cull_queue(afl_state_t *afl) {
 
       if (!afl->top_rated[i]->favored && !afl->top_rated[i]->disabled) {
 
-        afl->top_rated[i]->favored = 1;
+        struct queue_entry *q = afl->top_rated[i];
+        q->favored = 1;
         ++afl->queued_favored;
 
-        if (!afl->top_rated[i]->was_fuzzed) {
+        /* AFLNet state-aware mode: only count seeds that reach the current
+           target state (or initial seeds) and have not been fuzzed for that
+           state yet.  Mirrors original AFLNet's update_bitmap_score +
+           cull_queue: state-aware pending_favored is only used while a
+           state-aware (IPSM) iteration is active (!code_aware_schedule). */
+        if (unlikely(afl->afl_env.aflnet_mode && afl->aflnet &&
+                     afl->aflnet->state_mode &&
+                     !afl->aflnet->code_aware_schedule)) {
+
+          if ((q->generating_state_id == afl->aflnet->target_state_id ||
+               q->is_initial_seed) &&
+              !aflnet_is_seed_fuzzed(afl, q)) {
+
+            ++afl->pending_favored;
+            if (unlikely(afl->smallest_favored < 0 ||
+                         afl->smallest_favored > (s64)q->id)) {
+
+              afl->smallest_favored = (s64)q->id;
+
+            }
+
+          }
+
+        } else if (!q->was_fuzzed) {
 
           ++afl->pending_favored;
           if (unlikely(afl->smallest_favored < 0 ||
-                       afl->smallest_favored > (s64)afl->top_rated[i]->id)) {
+                       afl->smallest_favored > (s64)q->id)) {
 
-            afl->smallest_favored = (s64)afl->top_rated[i]->id;
+            afl->smallest_favored = (s64)q->id;
 
           }
 

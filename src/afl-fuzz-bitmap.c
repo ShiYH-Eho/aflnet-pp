@@ -1022,6 +1022,8 @@ may_save_fault:
 
     keep_as_crash:
 
+      fault = FSRV_RUN_CRASH;
+
       /* This is handled in a manner roughly similar to timeouts,
          except for slightly different limits and no need to re-run test
          cases. */
@@ -1124,6 +1126,12 @@ may_save_fault:
 
     ck_write(fd, mem, len, fn);
     close(fd);
+
+    /* AFLNet: keep a replayable copy alongside every saved fault.  The
+       replayable file uses the same basename as the raw crashes/hangs entry
+       and contains only the messages actually sent before the failure. */
+    aflnet_save_replayable_fault(afl, mem, len, fn,
+                                 fault == FSRV_RUN_CRASH);
 
   }
 

@@ -26,7 +26,8 @@ To select the different instrumentation modes, use one of the following options:
 
     - `GCC_PLUGIN` (afl-g*-fast)
     - `LLVM` (afl-clang-fast*)
-    - `LTO` (afl-clang-lto*).
+    - `LTO` (afl-clang-lto*)
+    - `CLANG` (legacy assembler instrumentation via afl-clang*).
 
 The compile-time tools do not accept AFL-specific command-line options. The
 --afl-MODE command line option is the only exception. The other options make
@@ -336,6 +337,198 @@ Recommended usage:
     mining allocation-size values.
   - Prefer LTO for `BUDGET` and `SIZEFILL` campaigns when the checked APIs are
     split across translation units.
+
+#### State-variable feedback (AFLNet)
+
+`AFL_LLVM_STATEVAR=1` during compilation enables
+`afl-llvm-statevar-pass.so`, which records the value of every variable
+annotated `__AFL_STATE_VAR__` into a dedicated 16 KB shared memory region.
+The pass is available with `afl-clang-fast`, `afl-clang-lto` and the legacy
+assembler-based `afl-clang`.
+With `AFLNET_STATE_MODE=2` the fuzzer creates that region, hashes it after
+every server response and uses the resulting id as the protocol state, so the
+inferred state machine follows target state variables instead of response
+codes.
+
+The annotation can be placed on a whole global, on a struct member, on a
+pointer and on function parameters or automatic locals; every store to it is
+instrumented after optimization, so only observable state is recorded:
+
+```c
+#include <stdint.h>
+
+static unsigned int g_counter __attribute__((annotate("__AFL_STATE_VAR__")));
+struct session *g_sess __attribute__((annotate("__AFL_STATE_VAR__")));
+
+struct session {
+
+  __attribute__((annotate("__AFL_STATE_VAR__"))) int stage;
+  int                                           unrelated;  // not recorded
+
+};
+```
+
+Every annotated object gets one 8-byte slot. Integers are recorded
+zero-extended; a pointer is never recorded as an address (that would put ASLR
+into the state) but as the state behind it:
+
+* pointer to an integer (`int *`, `unsigned char *`, ...) - the pointed-to
+  integer is recorded, reading exactly as many bytes as the pointee type has.
+  Assign the pointer *after* filling the pointee, the value recorded is the
+  one the pointee holds at that moment.
+* pointer to anything else (struct, union, array, float, function, ...) - only
+  whether the pointer is NULL is recorded, as `0` or `1`; the pointee is never
+  read.
+* NULL of any kind - recorded as `0`.
+
+Writing a pointer whose pointee type cannot be inferred from the source
+expression (e.g. `p = make_int_ptr();`) falls back to `sizeof(int)` and the
+pointed-to integer is recorded. Without `AFL_LLVM_STATEVAR=1` the pass is not
+loaded and the annotation attribute is inert (useful to keep one source tree
+working for both state modes). Note that feeding the fuzzer more than 16 KB of
+state variables wraps the slot index, so keep the annotated set small.
+
+See `test/test-statevar.sh` for the instrumentation self-test.
+
+The state variables themselves do not have to be found by hand:
+`utils/AI-agent/statevar/identify.py` lets an LLM agent read the target's source
+(the same `list_dir`/`read_file`/`search_text` tools) against the three
+server-state criteria and reports the variables with their definition sites, and
+`utils/AI-agent/statevar/annotate.py` writes the attribute there. The seed
+corpus the campaign starts from can be prepared the same way:
+`utils/AI-agent/corpus-enrich/enrich_corpus.py` reads
+a corpus of message sequences and adds LLM-written service workflows. Adding
+`--grammar` also enriches message types, and adding `--statevars` also targets
+the values/branches of those state variables. The tasks are additive. An
+optional `--root` exposes the target source/config tree through read-only local
+tools (`list_dir`, `read_file`, `search_text`). See
+`utils/AI-agent/corpus-enrich/README.md`.
+
+#### Sockhook session synchronisation (AFLNet)
+
+`AFLNET_SHM_SYNC=1` arms the shared-memory rendezvous of the preloaded
+`utils/sockhook/sockhook.so` **without** the sock2shm message redirection
+(`AFLNET_SOCK_MODE=1`, the default real-socket interaction): the messages keep
+travelling over the socket, but the target and the fuzzer share the turn, so
+
+  - the target publishes its readiness in `accept()` ("the server is
+    listening, dial me"), which removes the connect/listen race and lets the
+    fuzzer know the *user side* is up instead of retrying blindly;
+  - ownership starts on the server side; when the target enters `recv()` with
+    no request it publishes `CLIENT` ("I am waiting for your input") and parks
+    on the token.  The fuzzer waits for that `CLIENT` before it sends and hands
+    `SERVER` back, so a request is never read before it was sent and a silent
+    exchange is not mistaken for a stalled one;
+  - a session end is signalled explicitly, so a target parked in `recv()`
+    returns immediately instead of making the run hit the timeout.
+
+The fuzzer side lives in `src/aflnet/utils/sock2shm.c` and is driven from
+`src/aflnet/net.c`; it creates only the check segment (the msg/data plane is
+reserved for `sock_mode=2`), exports `__AFL_SHMSYNC=1` to the target and arms
+a clean session before every run. Before each request the fuzzer waits for the
+target's `CLIENT` turn (see `aflnet_sync_ops_t.wait_request_turn`), then sends
+and hands `SERVER` back; before reading a response it makes one bounded
+best-effort wait for the target to return to `recv`
+(`wait_response_ready`). `AFLNET_SOCK2SHM_WAIT_TIME` bounds the fuzzer-side
+waits (default 100 ms). Without `AFLNET_SHM_SYNC` nothing changes: the library
+stays inert and no shared segment is created, so the default configuration is
+byte-identical to a plain `AFLNET_SOCK_MODE=1` run.  `sock_mode=2` implies the
+rendezvous as well: its exchange cleanup sends the normal end notification
+(`aflnet_sock2shm_notify_end()`) so a target parked in the SHM turn-taking is
+released instead of waiting for the run timeout.
+
+See `test/test-shmsync.sh` for the contract test (readiness notification, the
+turn-taking gate at `recv()`, the explicit session end, and the inert default)
+and `utils/sockhook/README.md` for the target-facing hooks.
+
+#### Protocol grammar template guided mutation (AFLNet)
+
+`AFLNET_GRAMMAR` points at a template file, or at a directory holding one
+template per file, and enables grammar template guided mutation. The option is
+purely path driven: as long as it is unset (or empty) the feature is completely
+inactive and the fuzzer behaves as before.
+
+A template describes the shape of one protocol message in two lines: the first
+line is a PCRE2 header pattern whose capture groups are the *variable fields* of
+the message, the second line is a PCRE2 field pattern used to find further
+mutable fields after the header. The file name is the template (message type)
+name, e.g. `protocol-grammars/APPEND`:
+
+```
+^(?:(.*) APPEND (.*) (.*) (.*) (.*)\r\n)$
+(.+)
+```
+
+A message that spans several lines (a request line followed by headers, as RTSP
+and SIP write them) is described in the same two lines: the request line - the
+one that carries the message type - is the header pattern and every remaining
+line becomes an alternative of the field pattern, so the header match ends with
+the request line and the remaining fields are found from there on, e.g.
+
+```
+^(?:SETUP (.*)\r\n)
+(?|(?:CSeq: (.*)\r\n)|(?:\r\n)|(?:Transport: (.*)\r\n))
+```
+
+When a template matches the AFLNet mutation target (the state-relevant message
+M2), M2 is narrowed down to one randomly picked mutable field of that template:
+the bytes before and after the field become part of M1/M3, so the whole
+mutation pipeline of the fuzzer only ever sees the field and the message is
+reassembled before it is sent and saved. The protocol structure outside the
+variable fields is therefore preserved. The template only guides the existing
+mutators - nothing is generated from the grammar, and template sequences are
+not supported (yet).
+
+The feature is bound to AFLNet mode (`AFLNET_URL` + `AFLNET_PROTOCOL`) and to
+the region based mutation path, so it needs no changes in the core fuzzer.
+
+Enabling the option also aligns the mutation strategies with the protocol type:
+text protocols (SMTP, FTP, RTSP, SIP, HTTP, IMAP, POP3) are fuzzed with AFL++'s
+TEXT strategies, the other protocols of the AFLNet handler table (TLS, DNS,
+DHCP, MQTT, SSH, SNMP, ...) with the BINARY ones. An explicit `-a text|binary`
+on the command line takes precedence.
+
+`AFLNET_GRAMMAR_EXPLORE_PROB` (0..100, default 50) is the percentage of fuzz
+iterations that keep M2 as a whole instead of narrowing it to a field (the
+equivalent of ChatState's exploration/exploitation split).
+
+PCRE2 (`libpcre2-dev`) is required for this; without it the option is compiled
+out. Seeds or messages that match no template fall back to whole-message
+mutation. Templates are imported once at startup (`Imported N protocol grammar
+template(s) from ...`) and every narrowed iteration prints `Grammar template
+'X' matched M2: mutating field [a,b) of N mutable window(s)`.
+
+For a grammar directory that also contains `.binary-formats.json`, the fuzzer
+loads its per-type `probe` entries and uses the most specific matching probe to
+select the binary template. If the file is absent or invalid, regex matching is
+unchanged. Once probes are loaded, a template with a probe entry is eligible
+only when its probes identify M2, so another message type's broad header cannot
+capture it; templates without probe entries still use regex fallback.
+
+Note that mutation stages that run *before* the region selection (e.g. the
+FrameShift structure analysis) are not affected by the grammar.
+
+`utils/AI-agent/pro-template/gen_templates.py` writes such a directory for a protocol
+without hand work: it asks an OpenAI compatible endpoint for the client request
+types of `<protocol>` (one `<<PLACEHOLDER>>` marked example message each) and
+derives the PCRE2 patterns itself - splitting a request that carries a header
+block into its request line and its header fields - so a model answer can never
+inject a broken or invented regex. One file per message type plus a
+`.templates.json` companion
+describing every template are written; a second round asks for the types the
+first one missed. `--from-answer` converts a captured answer offline,
+`--dump-prompt` prints the prompt for a chat UI, and
+`--check <dir> [--seeds <dir>]` re-reads a directory and scores its templates
+against a seed corpus (unmatched templates are the usual sign of a wrong
+terminator). `--mode binary` switches to binary protocols: the model returns a
+byte example plus a field layout (offset/size/kind/mutable) and a type probe, and
+the tool derives a prefix-anchored byte template from it, keeping lengths and
+checksums non-mutating. It also writes `.binary-formats.json` (probe, layout,
+stream framing) so `corpus-enrich --formats` can split binary seeds by their
+length field and classify messages by probe. With `--root <dir>` the model may
+read the implementation first through the same read-only tools the other
+`utils/AI-agent` tools use. See
+`utils/AI-agent/pro-template/README.md`.
 
 #### CMPLOG
 

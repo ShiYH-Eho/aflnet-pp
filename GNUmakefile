@@ -32,7 +32,7 @@ VERSION     = $(shell grep '^$(HASH)define VERSION ' ../config.h | cut -d '"' -f
 
 PROGS       = afl-fuzz afl-showmap afl-tmin afl-gotcpu afl-analyze afl-cmin
 SH_PROGS    = afl-plot afl-cmin.awk afl-cmin.bash afl-cmin.py afl-whatsup afl-addseeds afl-system-config afl-persistent-config afl-cc afl-health
-HEADERS     = include/afl-fuzz.h include/afl-mutations.h include/afl-persistent-replay.h include/afl-prealloc.h include/afl-record-compat.h include/alloc-inl.h include/android-ashmem.h include/cmplog.h include/common.h include/config.h include/coverage-32.h include/coverage-64.h include/debug.h include/envs.h include/forkserver.h include/hash.h include/list.h include/sharedmem.h include/snapshot-inl.h include/t1ha.h include/t1ha0_ia32aes_b.h include/t1ha_bits.h include/t1ha_selfcheck.h include/types.h include/xxhash.h include/afl-ijon-min.h
+HEADERS     = include/afl-as.h include/afl-fuzz.h include/afl-mutations.h include/afl-persistent-replay.h include/afl-prealloc.h include/afl-record-compat.h include/alloc-inl.h include/android-ashmem.h include/cmplog.h include/common.h include/config.h include/coverage-32.h include/coverage-64.h include/debug.h include/envs.h include/forkserver.h include/hash.h include/list.h include/sharedmem.h include/snapshot-inl.h include/t1ha.h include/t1ha0_ia32aes_b.h include/t1ha_bits.h include/t1ha_selfcheck.h include/types.h include/xxhash.h include/afl-ijon-min.h
 MANPAGES=$(foreach p, $(PROGS) $(SH_PROGS), $(p).8)
 ASAN_OPTIONS=detect_leaks=0
 
@@ -206,7 +206,7 @@ ifeq "$(SYS)" "Haiku"
   #SPECIAL_PERFORMANCE += -DUSEMMAP=1
 endif
 
-AFL_FUZZ_FILES = $(wildcard src/afl-fuzz*.c) src/afl-main.c
+AFL_FUZZ_FILES = $(wildcard src/afl-fuzz*.c) src/afl-main.c $(wildcard src/aflnet/*.c) $(wildcard src/aflnet/utils/*.c)
 
 ifneq "$(shell command -v python3m 2>/dev/null)" ""
   ifneq "$(shell command -v python3m-config 2>/dev/null)" ""
@@ -282,7 +282,7 @@ ifneq "$(findstring OpenBSD, $(SYS))" ""
   override LDFLAGS += -lpthread -lm
 endif
 
-COMM_HDR    = include/alloc-inl.h include/config.h include/debug.h include/types.h include/afl-fuzz.h include/hash.h include/sharedmem.h include/forkserver.h include/common.h include/list.h
+COMM_HDR    = include/alloc-inl.h include/config.h include/debug.h include/types.h include/afl-fuzz.h include/aflnet.h include/hash.h include/sharedmem.h include/forkserver.h include/common.h include/list.h
 
 ifeq "$(shell echo '$(HASH)include <Python.h>@int main() {return 0; }' | tr @ '\n' | $(CC) $(CFLAGS) -x c - -o .test $(PYTHON_INCLUDE) $(LDFLAGS) $(PYTHON_LIB) 2>/dev/null && echo 1 || echo 0 ; rm -f .test )" "1"
 	PYTHON_OK=1
@@ -331,8 +331,10 @@ ifeq "$(ARCH)" "aarch64"
 endif
 
 .PHONY: all
-all:	test_x86 test_shm test_python ready $(PROGS) llvm gcc_plugin test_build all_done
+all:	test_x86 test_shm test_python ready $(PROGS) afl-as llvm gcc_plugin test_build all_done
 	-$(MAKE) -C utils/aflpp_driver
+	-$(MAKE) -C utils/sockhook
+	-$(MAKE) -C utils/aflnet
 	@echo
 	@echo
 	@echo
@@ -345,6 +347,9 @@ ifneq "$(SYS)" "Darwin"
 	@test -e afl-gcc-pass.so && echo "[+] gcc_mode successfully built" || echo "[-] gcc_mode could not be built, it is optional, install gcc-VERSION-plugin-dev to enable this"
 endif
 	@test -e afl-cc || echo "[-] AFL++ instrumentation compilers could not be built! Install llvm-VERSION-dev or gcc-VERSION-plugin-dev, see docs/INSTALL.md!"
+	@test -e afl-as && echo "[+] Legacy afl-clang assembler successfully built" || echo "[-] afl-as could not be built"
+	@test -e utils/sockhook/sockhook.so && echo "[+] sockhook preload library successfully built" || echo "[-] sockhook could not be built, it is optional, run make -C utils/sockhook"
+	@test -e utils/aflnet/aflnet-replay && echo "[+] AFLNet replayers (aflnet-replay, afl-replay) successfully built" || echo "[-] AFLNet replayers could not be built, run make -C utils/aflnet"
 	@echo
 
 .PHONY: llvm
@@ -473,6 +478,17 @@ else
   $(info [!] Warning: no ZLIB detected)
 endif
 
+# PCRE2 is needed for the protocol grammar template guided mutation
+# (src/aflnet/grammar.c).  Without it the fuzzer still builds, the feature is
+# just compiled out.
+ifeq "$(shell echo '$(HASH)define PCRE2_CODE_UNIT_WIDTH 8@$(HASH)include <pcre2.h>@int main() { pcre2_code *c = pcre2_compile((PCRE2_SPTR)0, 0, 0, 0, 0, 0); pcre2_code_free(c); return 0; }' | tr @ '\n' | $(CC) $(CFLAGS) -Werror -x c - $(LDFLAGS) -lpcre2-8 -o .test 2>/dev/null && echo 1 || echo 0 ; rm -f .test )" "1"
+  override SPECIAL_PERFORMANCE += -DHAVE_PCRE2
+  override LDFLAGS += -lpcre2-8
+  $(info [+] PCRE2 detected)
+else
+  $(info [!] Warning: no PCRE2 detected - grammar template guided mutation is disabled)
+endif
+
 .PHONY: test_python
 ifeq "$(PYTHON_OK)" "1"
 test_python:
@@ -486,6 +502,10 @@ endif
 .PHONY: ready
 ready:
 	@echo "[+] Everything seems to be working, ready to compile. ($(shell $(CC) --version 2>&1|head -n 1))"
+
+afl-as: src/afl-as.c include/afl-as.h $(COMM_HDR) | test_x86
+	$(CC) $(CFLAGS) src/$@.c -o $@ $(LDFLAGS)
+	@ln -sf afl-as as
 
 src/afl-performance.o: $(COMM_HDR) src/afl-performance.c
 	$(CC) $(CFLAGS) $(CFLAGS_FLTO) $(CFLAGS_OPT) $(SPECIAL_PERFORMANCE) -Iinclude -c src/afl-performance.c -o src/afl-performance.o
@@ -659,7 +679,7 @@ code-format:
 
 .PHONY: test_build
 ifndef AFL_NO_X86
-test_build: afl-cc afl-showmap
+test_build: afl-cc afl-as afl-showmap
 	@echo "[*] Testing the CC wrapper afl-cc and its instrumentation output..."
 	@unset AFL_MAP_SIZE AFL_USE_UBSAN AFL_USE_CFISAN AFL_USE_LSAN AFL_USE_ASAN AFL_USE_MSAN AFL_LLVM_ALLOWLIST AFL_LLVM_DENYLIST; ASAN_OPTIONS=detect_leaks=0 AFL_INST_RATIO=100 AFL_PATH=. ./afl-cc test-instr.c $(LDFLAGS) -o test-instr 2>&1 || (echo "Oops, afl-cc failed"; exit 1 )
 	-ASAN_OPTIONS=detect_leaks=0 ./afl-showmap -q -m none -o .test-instr0 ./test-instr < /dev/null
@@ -707,6 +727,7 @@ clean:
 	-$(MAKE) -C utils/afl_network_proxy clean
 	-$(MAKE) -C utils/socket_fuzzing clean
 	-$(MAKE) -C utils/argv_fuzzing clean
+	-$(MAKE) -C utils/aflnet clean
 	-$(MAKE) -C utils/plot_ui clean
 	-$(MAKE) -C qemu_mode/unsigaction clean
 	-$(MAKE) -C qemu_mode/fastexit clean
@@ -756,6 +777,7 @@ endif
 	-$(MAKE) -C utils/afl_network_proxy
 	-$(MAKE) -C utils/socket_fuzzing
 	-$(MAKE) -C utils/argv_fuzzing
+	-$(MAKE) -C utils/aflnet
 	# -$(MAKE) -C utils/plot_ui
 ifndef NO_FRIDA
 	-$(MAKE) -C frida_mode -j1
@@ -789,6 +811,7 @@ endif
 	-$(MAKE) -C utils/afl_network_proxy
 	-$(MAKE) -C utils/socket_fuzzing
 	-$(MAKE) -C utils/argv_fuzzing
+	-$(MAKE) -C utils/aflnet
 	# -$(MAKE) -C utils/plot_ui
 ifndef NO_FRIDA
 	-$(MAKE) -C frida_mode -j1
@@ -893,6 +916,8 @@ install: all $(MANPAGES)
 	install -m 755 $(PROGS) $(SH_PROGS) $${DESTDIR}$(BIN_PATH)
 	@if [ -f afl-qemu-trace ]; then install -m 755 afl-qemu-trace $${DESTDIR}$(BIN_PATH); fi
 	@if [ -f afl-qemu-bridge ]; then install -m 755 afl-qemu-bridge $${DESTDIR}$(BIN_PATH); fi
+	install -m 755 afl-as $${DESTDIR}$(HELPER_PATH)
+	ln -sf afl-as $${DESTDIR}$(HELPER_PATH)/as
 	@if [ -f utils/plot_ui/afl-plot-ui ]; then install -m 755 utils/plot_ui/afl-plot-ui $${DESTDIR}$(BIN_PATH); fi
 	@if [ -f libdislocator.so ]; then set -e; install -m 755 libdislocator.so $${DESTDIR}$(HELPER_PATH); fi
 	@if [ -f libtokencap.so ]; then set -e; install -m 755 libtokencap.so $${DESTDIR}$(HELPER_PATH); fi
@@ -904,6 +929,7 @@ install: all $(MANPAGES)
 	@if [ -f afl-frida-trace.so ]; then install -m 755 afl-frida-trace.so $${DESTDIR}$(HELPER_PATH); fi
 	@if [ -f libnyx.so ]; then install -m 755 libnyx.so $${DESTDIR}$(HELPER_PATH); fi
 	@if [ -f utils/afl_network_proxy/afl-network-server ]; then $(MAKE) -C utils/afl_network_proxy install; fi
+	@if [ -f utils/aflnet/aflnet-replay ]; then $(MAKE) -C utils/aflnet install; fi
 	@if [ -f utils/aflpp_driver/libAFLDriver.a ]; then set -e; install -m 644 utils/aflpp_driver/libAFLDriver.a $${DESTDIR}$(HELPER_PATH); fi
 	@if [ -f utils/aflpp_driver/libAFLQemuDriver.a ]; then set -e; install -m 644 utils/aflpp_driver/libAFLQemuDriver.a $${DESTDIR}$(HELPER_PATH); fi
 	-$(MAKE) -f GNUmakefile.llvm install
@@ -925,9 +951,9 @@ endif
 
 .PHONY: uninstall
 uninstall:
-	-cd $${DESTDIR}$(BIN_PATH) && rm -f $(PROGS) $(SH_PROGS) afl-cs-proxy afl-qemu-trace afl-qemu-bridge afl-plot-ui afl-fuzz-document afl-network-client afl-network-server afl-g* afl-plot.sh afl-ld-lto afl-c* afl-lto*
+	-cd $${DESTDIR}$(BIN_PATH) && rm -f $(PROGS) $(SH_PROGS) aflnet-replay afl-replay afl-cs-proxy afl-qemu-trace afl-qemu-bridge afl-plot-ui afl-fuzz-document afl-network-client afl-network-server afl-g* afl-plot.sh afl-ld-lto afl-c* afl-lto*
 	-cd $${DESTDIR}$(INCLUDE_PATH) && rm -f $(HEADERS:include/%=%)
-	-cd $${DESTDIR}$(HELPER_PATH) && rm -f afl-g*.*o afl-llvm-*.*o afl-compiler-*.*o libdislocator.so libtokencap.so libcompcov.so libqasan.so afl-frida-trace.so libnyx.so socketfuzz*.so argvfuzz*.so libAFLDriver.a libAFLQemuDriver.a as afl-as SanitizerCoverage*.so compare-transform-pass.so cmplog-*-pass.so split-*-pass.so dynamic_list.txt injections.dic
+	-cd $${DESTDIR}$(HELPER_PATH) && rm -f afl-g*.*o afl-llvm-*.*o afl-compiler-*.*o afl-statevar-rt*.o libdislocator.so libtokencap.so libcompcov.so libqasan.so afl-frida-trace.so libnyx.so socketfuzz*.so argvfuzz*.so libAFLDriver.a libAFLQemuDriver.a as afl-as SanitizerCoverage*.so compare-transform-pass.so cmplog-*-pass.so split-*-pass.so dynamic_list.txt injections.dic
 	-rm -rf $${DESTDIR}$(MISC_PATH)/testcases $${DESTDIR}$(MISC_PATH)/dictionaries
 	-sh -c "ls docs/*.md | sed 's|^docs/|$${DESTDIR}$(DOC_PATH)/|' | xargs rm -f"
 	-cd $${DESTDIR}$(MAN_PATH) && rm -f $(MANPAGES)

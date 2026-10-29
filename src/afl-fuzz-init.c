@@ -933,6 +933,11 @@ void perform_dry_run(afl_state_t *afl) {
     q = afl->queue_buf[idx];
     if (unlikely(!q || q->disabled)) { continue; }
 
+    /* AFLNet: seeds from the initial corpus are marked as initial seeds
+       (mirrors original AFLNet perform_dry_run).  Used by the state-aware
+       scheduler / cull_queue to keep initial seeds in the favoured set. */
+    q->is_initial_seed = 1;
+
     u8  res;
     s32 fd;
 
@@ -959,6 +964,19 @@ void perform_dry_run(afl_state_t *afl) {
     close(fd);
 
     res = calibrate_case(afl, q, use_mem, 0, 1);
+
+    /* AFLNet: Update IPSM and save to replayable-queue */
+    if (afl->afl_env.aflnet_mode) {
+
+      aflnet_update_ipsm(afl, q);
+
+      u8 *fn_replay = alloc_printf("%s/replayable-queue/%s", afl->out_dir,
+                                       basename((char *)q->fname));
+      aflnet_save_testcase_to_file(afl, use_mem, (u32)read_len, fn_replay, 1,
+                                    afl->aflnet->messages_sent);
+      ck_free(fn_replay);
+
+    }
 
     /* For AFLFast schedules we update the queue entry */
     if (unlikely(afl->schedule >= FAST && afl->schedule <= RARE) &&
@@ -1312,6 +1330,8 @@ void perform_dry_run(afl_state_t *afl) {
           }
 
           close(fd);
+
+          aflnet_save_replayable_fault(afl, use_mem, read_len, crash_fn, 1);
 
 #ifdef __linux__
           if (afl->fsrv.nyx_mode) {
@@ -1829,6 +1849,85 @@ static u8 delete_files(u8 *path, u8 *prefix) {
 
 }
 
+/* Move a non-empty output subdirectory aside before starting a resumed run.
+   This mirrors the timestamped backups used for crashes/ and hangs/. */
+
+static u8 backup_dir_with_timestamp(u8 *path) {
+
+  time_t    cur_t = time(0);
+  struct tm t;
+  u8       *nfn;
+
+  localtime_r(&cur_t, &t);
+
+#ifndef SIMPLE_FILES
+
+  nfn = alloc_printf("%s.%04d-%02d-%02d-%02d:%02d:%02d", path,
+                     t.tm_year + 1900, t.tm_mon + 1, t.tm_mday, t.tm_hour,
+                     t.tm_min, t.tm_sec);
+
+#else
+
+  nfn = alloc_printf("%s_%04d%02d%02d%02d%02d%02d", path, t.tm_year + 1900,
+                     t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min, t.tm_sec);
+
+#endif                                                    /* ^!SIMPLE_FILES */
+
+  if (rename((char *)path, (char *)nfn)) {
+
+    ck_free(nfn);
+    return 0;
+
+  }
+
+  ck_free(nfn);
+  return 1;
+
+}
+
+/* Recreate an AFLNet replayable output directory.  On resume, preserve an
+   existing non-empty directory as a timestamped backup, just like crashes and
+   hangs; otherwise remove its contents so a new session cannot overwrite old
+   replay files. */
+
+static u8 prepare_replayable_dir(afl_state_t *afl, u8 *path) {
+
+  if (afl->in_place_resume) {
+
+    if (rmdir((char *)path) && errno != ENOENT) {
+
+      return backup_dir_with_timestamp(path);
+
+    }
+
+  } else {
+
+    struct stat st;
+
+    if (!lstat((char *)path, &st)) {
+
+      if (!S_ISDIR(st.st_mode)) {
+
+        if (unlink((char *)path)) { return 0; }
+
+      } else if (delete_files(path, NULL)) {
+
+        return 0;
+
+      }
+
+    } else if (errno != ENOENT) {
+
+      return 0;
+
+    }
+
+  }
+
+  return 1;
+
+}
+
 /* Get the number of runnable processes, with some simple smoothing. */
 
 double get_runnable_processes(void) {
@@ -2089,6 +2188,14 @@ static void handle_existing_out_dir(afl_state_t *afl) {
   if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
   ck_free(fn);
 
+  if (afl->afl_env.aflnet_mode) {
+
+    fn = alloc_printf("%s/replayable-queue", afl->out_dir);
+    if (!prepare_replayable_dir(afl, fn)) { goto dir_cleanup_failed; }
+    ck_free(fn);
+
+  }
+
   /* All right, let's do <afl->out_dir>/crashes/id:* and
    * <afl->out_dir>/hangs/id:*. */
 
@@ -2136,6 +2243,14 @@ static void handle_existing_out_dir(afl_state_t *afl) {
   if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
   ck_free(fn);
 
+  if (afl->afl_env.aflnet_mode) {
+
+    fn = alloc_printf("%s/replayable-crashes", afl->out_dir);
+    if (!prepare_replayable_dir(afl, fn)) { goto dir_cleanup_failed; }
+    ck_free(fn);
+
+  }
+
   fn = alloc_printf("%s/hangs", afl->out_dir);
 
   /* Backup hangs, too. */
@@ -2170,6 +2285,14 @@ static void handle_existing_out_dir(afl_state_t *afl) {
 #endif
   if (delete_files(fn, case_prefix)) { goto dir_cleanup_failed; }
   ck_free(fn);
+
+  if (afl->afl_env.aflnet_mode) {
+
+    fn = alloc_printf("%s/replayable-hangs", afl->out_dir);
+    if (!prepare_replayable_dir(afl, fn)) { goto dir_cleanup_failed; }
+    ck_free(fn);
+
+  }
 
   /* Handle IJON max directory - preserve during resume, clean during overwrite
    */
@@ -2399,6 +2522,26 @@ void setup_dirs_fds(afl_state_t *afl) {
   tmp = alloc_printf("%s/queue", afl->out_dir);
   if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
   ck_free(tmp);
+
+  if (afl->afl_env.aflnet_mode) {
+
+    /* AFLNet: directory for replayable test cases. */
+
+    tmp = alloc_printf("%s/replayable-queue", afl->out_dir);
+    if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
+    ck_free(tmp);
+
+    /* AFLNet: replayable copies of recorded crashes and hangs. */
+
+    tmp = alloc_printf("%s/replayable-crashes", afl->out_dir);
+    if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
+    ck_free(tmp);
+
+    tmp = alloc_printf("%s/replayable-hangs", afl->out_dir);
+    if (mkdir(tmp, afl->dir_perm)) { PFATAL("Unable to create '%s'", tmp); }
+    ck_free(tmp);
+
+  }
 
   /* Top-level directory for queue metadata used for session
      resume and related tasks. */
@@ -3398,6 +3541,28 @@ void check_binary(afl_state_t *afl, u8 *fname) {
     OKF(cPIN "Deferred forkserver binary detected.");
     setenv(DEFER_ENV_VAR, "1", 1);
     afl->deferred_mode = 1;
+
+  } else if (getenv(AFLNET_DEFER_ENV_VAR)) {
+
+    /* AFLNet: value-aware deferred-forkserver switch (AFL_DEFER_FORKSRV is
+       deprecated and means "enforced" as soon as it is present, so "=0"
+       cannot turn deferred mode off).  Non-zero defers, 0 explicitly keeps
+       the native constructor forkserver, unset falls through to
+       AFL_DEFER_FORKSRV below.  The target / preloaded sockhook is always
+       told via DEFER_ENV_VAR (__AFL_DEFER_FORKSRV). */
+    if (atoi(getenv(AFLNET_DEFER_ENV_VAR)) != 0) {
+
+      OKF(cPIN "Deferred forkserver enforced (AFLNET_DEFER_FORKSRV).");
+      setenv(DEFER_ENV_VAR, "1", 1);
+      afl->deferred_mode = 1;
+
+    } else {
+
+      ACTF("AFLNET_DEFER_FORKSRV=0 - using the native forkserver.");
+      unsetenv(DEFER_ENV_VAR);
+      afl->deferred_mode = 0;
+
+    }
 
   } else if (getenv("AFL_DEFER_FORKSRV")) {
 

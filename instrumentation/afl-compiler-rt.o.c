@@ -254,7 +254,8 @@ u32        __afl_bug_mode __attribute__((weak)) = 0;
 static u8  __afl_bug_runtime_configured = 0;
 static u32 __afl_bug_configured_mode = 0;
 static u8  __afl_bug_map_active = 0;
-static u8  __afl_bug_map_increased = 0;
+static u8 __afl_bug_map_increased = 0;
+
 /* Per-thread stack of nested BUDGET / SIZEFILL frames.
    Previously begin/check used a single global (base, max_off), so an
    inner instrumented call's wsBegin overwrote the outer frame and the

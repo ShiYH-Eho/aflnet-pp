@@ -220,6 +220,37 @@ u32 check_binary_signatures(u8 *fn) {
     setenv(DEFER_ENV_VAR, "1", 1);
     ret += 2;
 
+  } else if (getenv(AFLNET_DEFER_ENV_VAR)) {
+
+    /* AFLNet: value-aware deferred-forkserver switch (AFL_DEFER_FORKSRV is
+       deprecated and means "enforced" as soon as it is present, so "=0"
+       cannot turn deferred mode off).  Non-zero defers, 0 explicitly keeps
+       the native constructor forkserver, unset falls through to
+       AFL_DEFER_FORKSRV below.  The target is always told via
+       DEFER_ENV_VAR (__AFL_DEFER_FORKSRV). */
+    if (atoi(getenv(AFLNET_DEFER_ENV_VAR)) != 0) {
+
+      if (!be_quiet) {
+
+        OKF(cPIN "Deferred forkserver enforced (AFLNET_DEFER_FORKSRV).");
+
+      }
+
+      setenv(DEFER_ENV_VAR, "1", 1);
+      ret += 2;
+
+    } else {
+
+      if (!be_quiet) {
+
+        ACTF("AFLNET_DEFER_FORKSRV=0 - using the native forkserver.");
+
+      }
+
+      unsetenv(DEFER_ENV_VAR);
+
+    }
+
   } else if (getenv("AFL_DEFER_FORKSRV")) {
 
     if (!be_quiet) { OKF(cPIN "Deferred forkserver enforced."); }

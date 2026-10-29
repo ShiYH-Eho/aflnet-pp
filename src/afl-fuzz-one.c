@@ -358,7 +358,17 @@ u8 fuzz_one(afl_state_t *afl) {
 
   }
 
-  if (likely(afl->pending_favored)) {
+  /* AFLNet state-aware (IPSM) mode: when code_aware_schedule == 0 the current
+     seed was picked by the state-aware scheduler, so always fuzz it and skip
+     the generic skip heuristics below.  Mirrors original AFLNet, whose
+     fuzz_one always fuzzes the state-aware selected seed (the state-aware
+     skipping happens inside choose_seed(FAVOR) instead). */
+  if (unlikely(afl->afl_env.aflnet_mode && afl->aflnet &&
+               !afl->aflnet->code_aware_schedule)) {
+
+    /* fall through - fuzz the state-aware picked seed unconditionally */
+
+  } else if (likely(afl->pending_favored)) {
 
     /* If we have any favored, non-fuzzed new arrivals in the queue,
        possibly skip to them at the expense of already-fuzzed or non-favored
@@ -392,6 +402,11 @@ u8 fuzz_one(afl_state_t *afl) {
   }
 
 #endif                                                     /* ^IGNORE_FINDS */
+
+  /* AFLNet: reset the region-reassembly flag so calibration / trimming /
+     cmplog runs on the full message chain pass through common_fuzz_stuff()
+     untouched; it is re-enabled below only while fuzzing the M2 region. */
+  if (unlikely(afl->aflnet)) { afl->aflnet->region_mode = 0; }
 
 #ifdef _AFL_DOCUMENT_MUTATIONS
 
@@ -627,6 +642,38 @@ u8 fuzz_one(afl_state_t *afl) {
         }
 
       }
+
+    }
+
+  }
+
+  /* AFLNet state-aware (IPSM) region mode: run the whole mutation pipeline
+     (deterministic + custom + havoc + splice) on the M2 subsequence only,
+     keeping M1/M3 untouched.  common_fuzz_stuff() reassembles M1+M2+M3
+     before sending/saving.  Mirrors original AFLNet, whose fuzz_one fuzzes
+     only the region relevant to the target state. */
+  if (unlikely(afl->afl_env.aflnet_mode && afl->aflnet &&
+               afl->aflnet->state_mode && !afl->aflnet->code_aware_schedule)) {
+
+    u8  *m2 = NULL;
+    u32  m2_len = 0;
+
+    if (aflnet_prepare_region_fuzz_or_whole(afl, in_buf, len, &m2, &m2_len)) {
+
+      /* empty / unreadable input - nothing to fuzz */
+      goto abandon_entry;
+
+    }
+
+    /* when the split succeeded region_mode==1 and the whole pipeline runs on
+       M2; otherwise (unsplittable seed) keep the ORIGINAL full-chain path */
+    if (afl->aflnet->region_mode) {
+
+      orig_in = in_buf = m2;
+      len = m2_len;
+      out_buf = afl_realloc(AFL_BUF_PARAM(out), len);
+      if (unlikely(!out_buf)) { PFATAL("alloc"); }
+      memcpy(out_buf, in_buf, len);
 
     }
 
@@ -3660,6 +3707,14 @@ retry_splicing:
       in_buf = orig_in;
       len = afl->queue_cur->len;
 
+      /* AFLNet region mode: orig_in is the M2 buffer, restore the M2 length
+         (not the full chain length) so splicing stays inside M2. */
+      if (unlikely(afl->aflnet && afl->aflnet->region_mode)) {
+
+        len = afl->aflnet->region_m2_len;
+
+      }
+
     }
 
     /* Pick a random queue entry and seek to it. Don't splice with yourself. */
@@ -3781,6 +3836,10 @@ abandon_entry:
 
     if (likely(afl->pending_not_fuzzed)) { --afl->pending_not_fuzzed; }
     afl->queue_cur->was_fuzzed = 1;
+    /* AFLNet: mark this seed as fuzzed for the current target state so the
+       state-aware scheduler can skip it later (was_fuzzed_map).  No-op when
+       not in AFLNet/state-aware mode. */
+    aflnet_mark_seed_fuzzed(afl, afl->queue_cur);
     afl->reinit_table = 1;
     if (afl->queue_cur->favored) {
 

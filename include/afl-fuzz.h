@@ -50,6 +50,7 @@
 #include "sharedmem.h"
 #include "forkserver.h"
 #include "common.h"
+#include "aflnet.h"
 
 #include "afl-ijon-min.h"
 
@@ -315,6 +316,10 @@ struct queue_entry {
   struct queue_entry *mother;            /* queue entry this based on        */
   u8                 *trace_mini;        /* Trace bytes, if kept             */
   u8                 *testcase_buf;      /* The testcase buffer, if loaded.  */
+  region_t           *regions;           /* AFLNet request regions           */
+  u32                 region_count;      /* Number of AFLNet regions         */
+  u32                 generating_state_id; /* state targeted when generated  */
+  u8                  is_initial_seed;     /* seed from the initial corpus   */
   u8                 *cmplog_colorinput; /* the result buf of colorization   */
   struct tainted     *taint;             /* Taint information from CmpLog    */
   struct skipdet_entry *skipdet_e;
@@ -587,6 +592,8 @@ typedef struct afl_env_vars {
       *afl_testcache_entries, *afl_child_kill_signal, *afl_fsrv_kill_signal,
       *afl_target_env, *afl_persistent_record, *afl_exit_on_time;
 
+    u8 aflnet_mode;
+
   s32 afl_pizza_mode, afl_ijon_history_limit;
 
   uid_t afl_forksrv_uid;
@@ -819,6 +826,9 @@ typedef struct afl_state {
   struct queue_entry *queue,            /* Fuzzing queue (linked list)      */
       *queue_cur,                       /* Current offset within the queue  */
       *queue_top;                       /* Top of the list                  */
+
+  /* AFLNet inferred protocol state machine (IPSM) state */
+  aflnet_state_t *aflnet;
 
   // growing buf
   struct queue_entry **queue_buf;

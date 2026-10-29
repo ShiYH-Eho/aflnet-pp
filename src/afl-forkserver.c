@@ -496,6 +496,7 @@ void afl_fsrv_init(afl_forkserver_t *fsrv) {
   fsrv->real_map_size = fsrv->map_size;
   fsrv->use_fauxsrv = false;
   fsrv->last_run_timed_out = false;
+  fsrv->child_killed_by_fuzzer = 0;
   fsrv->debug = false;
   fsrv->uses_crash_exitcode = false;
   fsrv->uses_asan = 0;
@@ -578,6 +579,7 @@ void afl_fsrv_init_dup(afl_forkserver_t *fsrv_to, afl_forkserver_t *from) {
   fsrv_to->child_pid = -1;
   fsrv_to->use_fauxsrv = 0;
   fsrv_to->last_run_timed_out = 0;
+  fsrv_to->child_killed_by_fuzzer = 0;   /* per-run state, never inherited */
 
   fsrv_to->late_send = from->late_send;
   fsrv_to->custom_data_ptr = from->custom_data_ptr;
@@ -2005,7 +2007,20 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
     FATAL(
         "Timeout while initializing fork server (setting "
-        "AFL_FORKSRV_INIT_TMOUT may help)");
+        "AFL_FORKSRV_INIT_TMOUT may help)%s",
+        getenv(DEFER_ENV_VAR)
+            ? "\n\n"
+              "    - The target uses a deferred forkserver and did not reach "
+              "its init point in\n"
+              "      time.  When the deferred start is provided by a "
+              "preloaded library, that\n"
+              "      library has to resolve __afl_manual_init(), i.e. the "
+              "target must export\n"
+              "      the AFL++ runtime symbols (afl-cc does this through "
+              "AFL++'s dynamic_list.txt;\n"
+              "      the classic afl-gcc/afl-clang assembler modes do "
+              "not).\n\n"
+            : "");
 
   }
 
@@ -2117,6 +2132,23 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
   }
 
+  /* The target is gone before the handshake.  With the deferred forkserver
+     that is most often a build problem - the deferred start point is never
+     reached, or the library providing it cannot resolve __afl_manual_init() -
+     so every variant of this message carries the same hint. */
+  const char *defer_hint =
+      getenv(DEFER_ENV_VAR)
+          ? "    - You are using deferred forkserver, but the deferred start "
+            "point was\n"
+            "      never reached.  When a preloaded library provides it, "
+            "check that it finds\n"
+            "      __afl_manual_init() in the target: the AFL++ runtime "
+            "symbols have to be\n"
+            "      exported (afl-cc does this through AFL++'s "
+            "dynamic_list.txt; the classic\n"
+            "      afl-gcc/afl-clang assembler modes do not).\n\n"
+          : "";
+
   if (fsrv->mem_limit && fsrv->mem_limit < 500 && fsrv->uses_asan) {
 
     SAYF("\n" cLRD "[-] " cRST
@@ -2126,8 +2158,9 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
          "with ASAN and\n"
          "    you have a restrictive memory limit configured, this is "
          "expected; please\n"
-         "    run with '-m 0'.\n",
-         which);
+         "    run with '-m 0'.\n\n"
+         "%s",
+         which, defer_hint);
 
   } else if (!fsrv->mem_limit) {
 
@@ -2136,6 +2169,8 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
          "complete"
          " a\n"
          "handshake with the injected code. You can try the following:\n\n"
+
+         "%s"
 
          "    - The target binary crashes because necessary runtime conditions "
          "it needs\n"
@@ -2153,7 +2188,7 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
 
          "Otherwise there is a horrible bug in the fuzzer.\n"
          "Poke the Fuzzing Zulip server for troubleshooting tips.\n",
-         which);
+         which, defer_hint);
 
   } else {
 
@@ -2204,11 +2239,7 @@ void afl_fsrv_start(afl_forkserver_t *fsrv, char **argv,
         "options\n"
         "      fail, poke the Fuzzing Zulip server for troubleshooting "
         "tips.\n",
-        getenv(DEFER_ENV_VAR)
-            ? "    - You are using deferred forkserver, but __AFL_INIT() is "
-              "never\n"
-              "      reached before the program terminates.\n\n"
-            : "",
+        defer_hint,
         which, stringify_int(val_buf, sizeof(val_buf), fsrv->mem_limit << 20),
         fsrv->mem_limit - 1);
 
@@ -2564,6 +2595,12 @@ fsrv_run_result_t __attribute__((hot)) afl_fsrv_run_target(
   u32 exec_ms;
   u32 write_value = fsrv->last_run_timed_out;
 
+  /* AFLNet -K (AFLNET_TERMINATE_CHILD): net.c sets this flag when it sends
+     SIGTERM to the child itself; reset it for every run so that a stale value
+     can never mask a real crash.  Both the futex path and the legacy path
+     below reach classify_result. */
+  fsrv->child_killed_by_fuzzer = 0;
+
 #ifdef AFL_PERSISTENT_RECORD
   fsrv_run_result_t retval = FSRV_RUN_OK;
   char             *persistent_out_fmt;
@@ -2892,6 +2929,23 @@ classify_result:
 
   }
 
+  /* AFLNet -K (AFLNET_TERMINATE_CHILD / net.c): the fuzzer terminated the
+     target itself after the exchange, which is how stateful servers are kept
+     from being reported as hangs.  AFLNet maps such a SIGTERM death to
+     FAULT_NONE; without this, every single run would be counted as a crash.
+     Scoped to our own kill *and* to SIGTERM, so a real crash (SIGSEGV, ...)
+     or a target that dies from SIGTERM on its own is still reported. */
+  if (unlikely(fsrv->child_killed_by_fuzzer &&
+               WIFSIGNALED(fsrv->child_status) &&
+               WTERMSIG(fsrv->child_status) == SIGTERM)) {
+
+    fsrv->child_killed_by_fuzzer = 0;
+    fsrv->last_kill_signal = 0;
+    fsrv->last_exit_code = 0;
+    return FSRV_RUN_OK;
+
+  }
+
   /* Did we crash?
   In a normal case, (abort) WIFSIGNALED(child_status) will be set.
   MSAN & LSAN in uses_asan mode use special exit codes as they doesn't support
@@ -3007,4 +3061,3 @@ void afl_fsrv_deinit(afl_forkserver_t *fsrv) {
 #endif
 
 }
-
